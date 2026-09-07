@@ -13,7 +13,7 @@ RUN useradd -m -u 1001 leadbot && mkdir -p /app /data && chown -R leadbot:leadbo
 WORKDIR /app
 COPY --chown=leadbot:leadbot server.mjs ui.html login.html segments.default.json package.json ./
 COPY --chown=leadbot:leadbot skill ./skill
-USER leadbot
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Persistent storage (users, history, runs, zoho.json) lives on a volume mounted here.
 ENV DATA_DIR=/data \
@@ -24,4 +24,7 @@ ENV DATA_DIR=/data \
     HOME=/home/leadbot
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD curl -fs http://localhost:8080/healthz || exit 1
+# The container starts as root only long enough for the entrypoint to chown the
+# volume; it then switches to leadbot before starting the server.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["node", "server.mjs"]
