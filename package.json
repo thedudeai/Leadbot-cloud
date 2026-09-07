@@ -1,0 +1,12 @@
+{
+  "name": "leadbot-cloud",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Hosted multi-user dashboard for the zoho-lead-profiler skill",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/"
+  }
+}

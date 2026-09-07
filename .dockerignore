@@ -1,0 +1,8 @@
+storage
+node_modules
+test
+*.md
+!README.md
+!skill/**/*.md
+.git
+.env

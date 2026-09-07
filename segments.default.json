@@ -1,0 +1,23 @@
+[
+  {
+    "id": "charter-schools",
+    "name": "Charter schools — PA / NJ / NY",
+    "note": "Flagged as a strong vertical in the 7 Aug run: hand-run back offices, multi-site payroll, state pension reporting (PSERS / TPAF / TRS), variable-hour after-school staff.",
+    "where": "((Industry like '%Education%' and State in ('PA','NJ','NY')) and Company like '%Charter%')",
+    "limit": 25
+  },
+  {
+    "id": "ny-care",
+    "name": "NY home care & health agencies",
+    "note": "Batch 1 of the 7 Aug run. Large headcounts, thin payroll vendor fingerprints.",
+    "where": "((State = 'NY' and Industry like '%Health%') and Company is not null)",
+    "limit": 25
+  },
+  {
+    "id": "unprofiled-newest",
+    "name": "Never profiled — newest first",
+    "note": "Anything without a Profiled_Date stamp, most recently added first.",
+    "where": "(Profiled_Date is null)",
+    "limit": 25
+  }
+]

@@ -1,0 +1,1242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lead Bot</title>
+<style>
+  :root{
+    --bg:#0e1117; --panel:#151a23; --panel2:#1b2130; --line:#252d3d;
+    --ink:#e8ecf3; --dim:#8f9bb1; --dim2:#65708a;
+    --accent:#5b8def; --accent-soft:#1e2b45;
+    --hot:#e2685f; --warm:#dd9a4a; --cool:#5b8def; --cold:#5b6479;
+    --ok:#4fae7d; --warn:#dd9a4a; --bad:#e2685f;
+    --r:10px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:14px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    display:flex; overflow:hidden;
+  }
+  button{font:inherit;cursor:pointer}
+  input,select,textarea{font:inherit}
+
+  aside{
+    width:212px; flex:0 0 212px; background:var(--panel); border-right:1px solid var(--line);
+    display:flex; flex-direction:column; padding:18px 12px; gap:2px;
+  }
+  .brand{display:flex;align-items:center;gap:9px;padding:4px 10px 18px;}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--dim2);flex:0 0 9px}
+  .dot.live{background:var(--ok);box-shadow:0 0 0 3px rgba(79,174,125,.18)}
+  .dot.busy{background:var(--warn);animation:pulse 1.1s infinite}
+  @keyframes pulse{50%{opacity:.35}}
+  .brand b{font-size:15px;letter-spacing:-.2px}
+  nav button{
+    display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;
+    background:none;border:0;color:var(--dim);text-align:left;
+    padding:9px 11px;border-radius:8px;
+  }
+  nav button:hover{background:var(--panel2);color:var(--ink)}
+  nav button.on{background:var(--accent-soft);color:var(--ink)}
+  nav .badge{
+    background:var(--panel2);color:var(--dim);border-radius:20px;
+    padding:1px 7px;font-size:11px;font-variant-numeric:tabular-nums;
+  }
+  nav button.on .badge{background:rgba(255,255,255,.1);color:var(--ink)}
+  .aside-foot{margin-top:auto;padding:10px;color:var(--dim2);font-size:11px;line-height:1.5;word-break:break-word}
+
+  main{flex:1;overflow-y:auto;padding:26px 30px 70px;max-width:1180px}
+  h1{font-size:20px;margin:0 0 4px;letter-spacing:-.3px}
+  .sub{color:var(--dim);margin:0 0 22px;max-width:70ch}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:26px 0 10px;font-weight:600}
+  .view{display:none} .view.on{display:block}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:16px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+
+  .btn{
+    background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+    padding:9px 15px;border-radius:8px;
+  }
+  .btn:hover{border-color:#39445c}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#08101f;font-weight:600}
+  .btn.primary:hover{background:#6f9cf2}
+  .btn.ghost{background:none}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn.sm{padding:5px 10px;font-size:12px;border-radius:7px}
+
+  .segs{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:12px}
+  .seg{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+    padding:14px;text-align:left;color:var(--ink);
+    /* A button centres its own content, which left the shorter cards in the
+       preset grid sitting lower than the taller ones. */
+    display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;
+  }
+  .seg:hover{border-color:#39445c}
+  .seg.on{border-color:var(--accent);background:var(--accent-soft)}
+  .seg b{display:block;margin-bottom:5px;font-size:14px}
+  .seg p{margin:0;color:var(--dim);font-size:12px;line-height:1.5}
+  .seg code{color:var(--dim2);font-size:11px;word-break:break-all;display:block;margin-top:8px}
+
+  table{width:100%;border-collapse:collapse}
+  th{
+    text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--dim2);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;
+  }
+  td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
+  tr.pick:hover td{background:var(--panel2)}
+  tbody tr:last-child td{border-bottom:0}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .muted{color:var(--dim)}
+  .tiny{font-size:12px}
+  input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer;margin:2px 0 0}
+
+  .pill{
+    display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;
+    border:1px solid transparent;white-space:nowrap;
+  }
+  .pill.hot{background:rgba(226,104,95,.14);color:var(--hot);border-color:rgba(226,104,95,.3)}
+  .pill.warm{background:rgba(221,154,74,.14);color:var(--warm);border-color:rgba(221,154,74,.3)}
+  .pill.cool{background:rgba(91,141,239,.14);color:var(--cool);border-color:rgba(91,141,239,.3)}
+  .pill.cold{background:rgba(91,100,121,.16);color:#9aa5bb;border-color:rgba(91,100,121,.35)}
+  .pill.ok{background:rgba(79,174,125,.14);color:var(--ok)}
+  .pill.bad{background:rgba(226,104,95,.14);color:var(--bad)}
+  .pill.flag{background:rgba(221,154,74,.14);color:var(--warn)}
+
+  .job{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);margin-bottom:10px;overflow:hidden}
+  .job-head{display:flex;align-items:center;gap:12px;padding:13px 15px}
+  .job-head b{flex:1;font-weight:600}
+  .spin{
+    width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--accent);
+    border-radius:50%;animation:spin .8s linear infinite;flex:0 0 13px;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .feed{
+    background:#0b0e14;border-top:1px solid var(--line);padding:10px 15px;
+    font:11.5px/1.7 ui-monospace,Menlo,Consolas,monospace;color:var(--dim);
+    max-height:150px;overflow-y:auto;
+  }
+  .feed .tool{color:#7fa3e8}
+
+  .detail{border-top:1px solid var(--line);padding:16px;background:var(--panel2)}
+  .kv{display:grid;grid-template-columns:132px 1fr;gap:5px 14px;margin-bottom:14px;font-size:13px}
+  .kv dt{color:var(--dim2)}
+  .kv dd{margin:0;word-break:break-word}
+  .note{margin-bottom:12px}
+  .note b{display:block;font-size:11px;letter-spacing:.06em;color:var(--dim2);margin-bottom:5px}
+  .note pre{
+    margin:0;background:#0b0e14;border:1px solid var(--line);border-radius:8px;padding:11px;
+    white-space:pre-wrap;font:12px/1.65 ui-monospace,Menlo,Consolas,monospace;color:#c9d3e4;
+    max-height:230px;overflow-y:auto;
+  }
+
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:15px}
+  .tile .n{font-size:25px;font-weight:600;letter-spacing:-.5px;font-variant-numeric:tabular-nums}
+  .tile .l{color:var(--dim);font-size:12px;margin-top:3px}
+  .tile .h{color:var(--dim2);font-size:11px;margin-top:6px;line-height:1.45}
+  .bars{display:grid;gap:7px}
+  .bar{display:grid;grid-template-columns:190px 1fr 62px;gap:11px;align-items:center;font-size:12.5px}
+  .bar .track{display:block;background:var(--panel2);border-radius:4px;height:9px;overflow:hidden}
+  .bar .fill{display:block;background:var(--accent);height:100%;border-radius:4px;min-width:2px}
+  .bar .v{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
+
+  .field{display:flex;flex-direction:column;gap:5px}
+  .field label{font-size:12px;color:var(--dim)}
+  .field input,.field select,.field textarea{
+    background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+    padding:8px 10px;border-radius:8px;
+  }
+  .field input:focus,.field textarea:focus,.field select:focus{outline:0;border-color:var(--accent)}
+  .field textarea{font:12px/1.6 ui-monospace,Menlo,Consolas,monospace;resize:vertical}
+  .empty{color:var(--dim2);padding:34px 0;text-align:center;font-size:13px}
+  .banner{
+    border-radius:var(--r);padding:12px 15px;margin-bottom:16px;font-size:13px;
+    border:1px solid var(--line);background:var(--panel);
+  }
+  .banner.bad{border-color:rgba(226,104,95,.4);background:rgba(226,104,95,.08)}
+  .banner.warn{border-color:rgba(221,154,74,.4);background:rgba(221,154,74,.08)}
+  .banner.ok{border-color:rgba(79,174,125,.4);background:rgba(79,174,125,.08)}
+  .bar-sticky{
+    position:sticky;bottom:0;margin:18px -30px -70px;padding:14px 30px 20px;
+    background:linear-gradient(transparent,var(--bg) 26%);
+    display:flex;gap:12px;align-items:center;
+  }
+  .link{background:none;border:0;color:var(--accent);padding:0;font-size:12px}
+
+  /* ---- lead browser (added) ---- */
+  .browse{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}
+  .browse .search{
+    background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+    padding:9px 12px;border-radius:8px;width:100%;
+  }
+  .browse .search:focus{outline:0;border-color:var(--accent)}
+  .filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .filters select{
+    background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+    padding:7px 9px;border-radius:8px;font-size:12.5px;max-width:190px;
+  }
+  .filters select:focus{outline:0;border-color:var(--accent)}
+  .browse .search:disabled,.filters select:disabled,.filters .link:disabled{opacity:.4;cursor:not-allowed}
+  .chip{
+    display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border-radius:20px;
+    font-size:12px;background:var(--accent-soft);border:1px solid rgba(91,141,239,.35);color:var(--ink);
+  }
+  .chip .link{font-size:11px}
+  .tablebar{
+    display:flex;align-items:center;gap:10px;padding:9px 12px;
+    border-bottom:1px solid var(--line);font-size:12px;color:var(--dim);
+  }
+  .pager{
+    display:flex;align-items:center;gap:10px;padding:10px 12px;
+    border-top:1px solid var(--line);font-size:12px;color:var(--dim);
+  }
+  th.sortable{cursor:pointer;user-select:none}
+  th.sortable:hover{color:var(--ink)}
+  th.sortable .arw{color:var(--accent);font-size:10px}
+  .help{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}
+  .help summary{cursor:pointer;color:var(--accent);font-size:12px;list-style:none}
+  .help summary::-webkit-details-marker{display:none}
+  .help ol{margin:10px 0 0;padding-left:18px;color:var(--dim);font-size:12.5px;line-height:1.7}
+  .help a{color:var(--accent)}
+  .warnbox{
+    border:1px solid rgba(221,154,74,.4);background:rgba(221,154,74,.08);
+    border-radius:8px;padding:10px 12px;font-size:12px;color:var(--dim);margin-top:12px;line-height:1.6;
+  }
+  .warnbox code{color:var(--ink)}
+</style>
+</head>
+<body>
+
+<aside>
+  <div class="brand"><span class="dot" id="dot"></span><b>Lead Bot</b></div>
+  <nav>
+    <button data-v="run" class="on"><span>Run</span><span class="badge" id="nb-run">—</span></button>
+    <button data-v="review"><span>Review</span><span class="badge" id="nb-review">0</span></button>
+    <button data-v="stats"><span>Stats</span><span class="badge" id="nb-stats">0</span></button>
+    <button data-v="segments" class="admin-only" style="display:none"><span>Segments</span></button>
+    <button data-v="team" class="admin-only" style="display:none"><span>Team</span><span class="badge" id="nb-team">0</span></button>
+    <button data-v="setup" class="admin-only" style="display:none"><span>Setup</span><span class="badge" id="nb-setup">?</span></button>
+  </nav>
+  <div class="aside-foot" id="foot">Idle.</div>
+  <div class="aside-foot" id="who" style="border-top:1px solid var(--line);padding-top:10px;margin-top:6px"></div>
+</aside>
+
+<main>
+
+<section class="view on" data-v="run">
+  <h1>Run</h1>
+  <p class="sub">Search Zoho, filter it, tick the leads worth the credits, and start. Browsing reads the CRM directly and costs nothing. Each lead you profile then gets its own Claude session on the server, and nothing reaches Zoho until you approve it in Review.</p>
+  <div id="scope-banner"></div>
+  <div id="run-banner"></div>
+
+  <h2>Segment presets</h2>
+  <div class="segs" id="seg-list"></div>
+
+  <h2>Browse leads</h2>
+  <div class="browse">
+    <input class="search" id="q" type="search" placeholder="Search company, last name, email or city…" />
+    <div class="filters">
+      <select id="f-state"><option value="">Any state</option></select>
+      <select id="f-industry"><option value="">Any industry</option></select>
+      <select id="f-owner"><option value="">Any owner</option></select>
+      <select id="f-profiled">
+        <option value="any">Any profiling</option>
+        <option value="never">Never profiled</option>
+        <option value="done">Already profiled</option>
+      </select>
+      <select id="f-sort">
+        <option value="created:desc">Newest first</option>
+        <option value="created:asc">Oldest first</option>
+        <option value="modified:desc">Recently modified</option>
+        <option value="company:asc">Company A–Z</option>
+        <option value="employees:desc">Largest headcount</option>
+      </select>
+      <button class="link" id="f-clear">Clear filters</button>
+    </div>
+    <div class="row">
+      <div class="field" style="flex-direction:row;align-items:center;gap:8px">
+        <label for="pepm">PEPM $</label>
+        <input id="pepm" type="number" min="1" step="1" style="width:76px" />
+      </div>
+      <button class="btn sm" id="load" style="display:none">Load leads via Claude</button>
+      <span class="muted tiny" id="load-note"></span>
+    </div>
+  </div>
+
+  <div id="picker"></div>
+  <div id="live"></div>
+</section>
+
+<section class="view" data-v="review">
+  <h1>Review</h1>
+  <p class="sub">Everything the run found, and exactly what it would write. Open a row to read the notes before you approve it. Nothing here has touched Zoho yet.</p>
+  <div id="review-body"></div>
+</section>
+
+<section class="view" data-v="stats">
+  <h1>Stats</h1>
+  <p class="sub" id="stats-sub">Across every run you have done. The coverage bars are the ones to watch — they show what the research actually manages to find.</p>
+  <div class="row" id="stats-scope" style="margin-bottom:14px" hidden>
+    <button class="btn sm on" data-scope="mine">My runs</button>
+    <button class="btn sm" data-scope="all">Everyone</button>
+  </div>
+  <div id="stats-body"></div>
+</section>
+
+<section class="view" data-v="team">
+  <h1>Team</h1>
+  <p class="sub">Who can sign in, what they can see, and which Zoho user they are. A person pinned to a Zoho owner only ever browses and profiles the leads they own in the CRM; an admin, or anyone marked "sees all", browses the whole org.</p>
+  <div id="team-body"></div>
+</section>
+
+<section class="view" data-v="segments">
+  <h1>Segments</h1>
+  <p class="sub">Saved targeting. Each one is a Zoho COQL <code>where</code> clause. Three org quirks worth remembering: no aggregates, three or more criteria need explicit parentheses <code>((a and b) and c)</code>, and <code>Owner = '&lt;id&gt;'</code> works while <code>Owner.id</code> does not.</p>
+  <div id="seg-editor"></div>
+  <div class="row" style="margin-top:14px">
+    <button class="btn" id="seg-add">Add segment</button>
+    <button class="btn primary" id="seg-save">Save</button>
+    <span class="muted tiny" id="seg-note"></span>
+  </div>
+</section>
+
+<section class="view" data-v="setup">
+  <h1>Setup</h1>
+  <p class="sub">Lead Bot does none of the work itself. The server launches Claude Code for each lead, and Claude does the searching and verifying through the company's connectors. This screen is where you confirm that link is live. Only admins see it.</p>
+
+  <h2>Zoho connection</h2>
+  <p class="sub" style="margin-bottom:12px">A direct link to the CRM. It makes the Run screen instant and free — no Claude session is started just to list records — and the write-back goes through it too. Profiling is still the Claude side of the job.</p>
+  <div id="zoho-body"></div>
+
+  <h2>The company's Claude account</h2>
+  <div id="conn-body"></div>
+
+  <h2>Preflight</h2>
+  <p class="sub" style="margin-bottom:12px">Starts one short Claude session and asks what it can actually see — the skill, the connectors, and whether your Leads module answers. Run it once now, and again any time something behaves oddly.</p>
+  <div id="pre-body"></div>
+
+  <h2>Settings</h2>
+  <div class="card">
+    <div class="segs">
+      <div class="field"><label for="c-conc">Leads at once, per person</label><input id="c-conc" type="number" min="1" max="8" /></div>
+      <div class="field"><label for="c-max">Claude sessions at once, whole company</label><input id="c-max" type="number" min="1" max="24" /></div>
+      <div class="field"><label for="c-cmd">Claude command</label><input id="c-cmd" /></div>
+      <div class="field"><label for="c-model">Model (blank = CLI default)</label><input id="c-model" placeholder="e.g. opus" /></div>
+      <div class="field"><label for="c-timeout">Per-lead timeout (min)</label><input id="c-timeout" type="number" min="5" max="90" /></div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn primary" id="c-save">Save settings</button>
+      <span class="muted tiny" id="c-note"></span>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<script>
+'use strict';
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const money = (n) => n == null ? '—' : '$' + Math.round(n).toLocaleString();
+const pct = (n) => (n * 100).toFixed(0) + '%';
+const api = async (p, body) => {
+  const r = await fetch(p, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  if (r.status === 401) { location.href = '/login'; return new Promise(() => {}); }
+  return r.json();
+};
+
+let S = { config: {}, segments: [], leads: [], run: null, stats: null, preflight: null, user: null, scope: { mapped: true, lockOwner: null }, admin: false };
+const isAdmin = () => !!S.admin;
+let chosenSeg = null;
+// Keyed by lead id and holding the whole row, so a selection survives paging,
+// filtering and searching — the run needs the full record, not just the id.
+const picked = new Map();
+const approved = new Set();
+const open = new Set();
+
+let zohoState = null;
+let zohoMeta = null;
+let fetching = false;
+let pageInfo = { hasMore: false, total: null };
+const browse = { q: '', state: '', industry: '', owner: '', profiled: 'any', sort: 'created', order: 'desc', page: 1, per: 50, where: '' };
+const direct = () => !!(zohoState && zohoState.configured && zohoState.ok);
+
+$$('nav button').forEach((b) => b.onclick = () => {
+  $$('nav button').forEach((x) => x.classList.toggle('on', x === b));
+  $$('.view').forEach((v) => v.classList.toggle('on', v.dataset.v === b.dataset.v));
+});
+const go = (v) => $('nav button[data-v="' + v + '"]').click();
+const setDot = (cls, text) => { $('#dot').className = 'dot ' + cls; $('#foot').textContent = text; };
+
+async function load() {
+  S = await api('/api/state');
+  chosenSeg = chosenSeg || S.activeSegment || null;
+  $('#pepm').value = S.config.pepm;
+  // style.display rather than the hidden attribute: the nav buttons carry their
+  // own display rule, which would win over [hidden].
+  $$('.admin-only').forEach((el) => { el.style.display = isAdmin() ? '' : 'none'; });
+  $('#stats-scope').hidden = !isAdmin();
+  renderWho();
+  renderScope();
+  renderAll();
+}
+function renderAll() { renderSegs(); renderPicker(); renderLive(); renderReview(); renderStats(); if (isAdmin()) { renderSegEditor(); renderSetup(); renderTeam(); } renderNav(); }
+
+function renderWho() {
+  const u = S.user || {};
+  $('#who').innerHTML = '<b style="color:var(--ink)">' + esc(u.name || '') + '</b>' +
+    '<span class="muted tiny" style="display:block">' + esc(u.email || '') + (u.role === 'admin' ? ' · admin' : '') + '</span>' +
+    '<div class="row" style="margin-top:8px;gap:10px"><button class="link" id="pw">Password</button><button class="link" id="out">Sign out</button></div>';
+  $('#out').onclick = async () => { await api('/api/logout', {}); location.href = '/login'; };
+  $('#pw').onclick = async () => {
+    const current = prompt('Current password'); if (current == null) return;
+    const password = prompt('New password (at least 8 characters)'); if (password == null) return;
+    const r = await api('/api/me/password', { current, password });
+    alert(r.error ? r.error : 'Password changed.');
+  };
+}
+
+// Says plainly whose leads this screen shows. For a pinned user that is the
+// answer to "why can't I see the lead I just added" — because it isn't theirs.
+function renderScope() {
+  const sc = S.scope || {}, u = S.user || {};
+  const host = $('#scope-banner');
+  if (!sc.mapped) {
+    host.innerHTML = '<div class="banner warn"><b>Your account is not linked to a Zoho user yet.</b><br>Until an admin maps you to your Zoho login under Team, there are no leads to show here.</div>';
+  } else if (sc.lockOwner) {
+    host.innerHTML = '<div class="banner" style="border-color:var(--line)"><span class="pill cool">your leads</span> Showing leads owned by <b>' + esc(u.zohoOwnerName || u.name) + '</b> in Zoho. Only an admin can browse the whole org.</div>';
+  } else host.innerHTML = '';
+}
+
+function renderNav() {
+  const jobs = (S.run && S.run.jobs) || [];
+  const done = jobs.filter((j) => j.result).length;
+  $('#nb-run').textContent = jobs.length ? done + '/' + jobs.length : (S.leads.length || '—');
+  $('#nb-review').textContent = done;
+  $('#nb-stats').textContent = (S.stats && S.stats.totalLeads) || 0;
+  const p = S.preflight;
+  $('#nb-setup').textContent = !p ? '?' : (p.skill && p.zoho && p.zohoLeadsReachable) ? '✓' : '!';
+}
+
+/* ---------------------------------------------------------- run: segments */
+function renderSegs() {
+  $('#seg-list').innerHTML = S.segments.map((s) =>
+    '<button class="seg ' + (s.id === chosenSeg ? 'on' : '') + '" data-id="' + esc(s.id) + '">' +
+      '<b>' + esc(s.name) + '</b><p>' + esc(s.note || '') + '</p>' +
+      '<code>' + esc(s.where) + '</code></button>').join('');
+  $$('#seg-list .seg').forEach((b) => b.onclick = () => applySegment(b.dataset.id));
+}
+
+/* A preset just fills the filter row — it replaces whatever was there. */
+function applySegment(id) {
+  chosenSeg = id;
+  const s = S.segments.find((x) => x.id === id);
+  if (direct() && s) {
+    browse.q = ''; browse.state = ''; browse.industry = ''; browse.owner = '';
+    browse.profiled = 'any'; browse.page = 1;
+    browse.where = s.where || '';
+    syncFilterInputs();
+    browseFetch();
+  }
+  renderSegs();
+}
+
+/* ---------------------------------------------------------- run: browse */
+function syncFilterInputs() {
+  $('#q').value = browse.q;
+  $('#f-state').value = browse.state;
+  $('#f-industry').value = browse.industry;
+  $('#f-owner').value = browse.owner;
+  $('#f-profiled').value = browse.profiled;
+  $('#f-sort').value = browse.sort + ':' + browse.order;
+}
+
+/* Any hand-set filter takes over from a preset's raw clause. */
+function filtersChanged() {
+  browse.where = ''; browse.page = 1; chosenSeg = null;
+  renderSegs(); browseFetch();
+}
+
+async function browseFetch() {
+  if (!direct()) return;
+  fetching = true; renderPicker();
+  const p = new URLSearchParams({
+    sort: browse.sort, order: browse.order,
+    page: String(browse.page), per: String(browse.per),
+  });
+  if (browse.where) p.set('where', browse.where);
+  else {
+    if (browse.q) p.set('q', browse.q);
+    if (browse.state) p.set('state', browse.state);
+    if (browse.industry) p.set('industry', browse.industry);
+    if (browse.owner) p.set('owner', browse.owner);
+    if (browse.profiled && browse.profiled !== 'any') p.set('profiled', browse.profiled);
+  }
+  let r;
+  try { r = await api('/api/zoho/leads?' + p.toString()); }
+  catch (e) { r = { error: String(e && e.message || e), leads: [] }; }
+  fetching = false;
+  if (r.error) {
+    $('#run-banner').innerHTML = '<div class="banner bad"><b>Zoho could not answer that query.</b><br>' + esc(r.error) +
+      (r.coql ? '<br><span class="muted tiny">' + esc(r.coql) + '</span>' : '') + '</div>';
+    S.leads = []; pageInfo = { hasMore: false, total: null };
+  } else {
+    $('#run-banner').innerHTML = '';
+    S.leads = r.leads || [];
+    pageInfo = { hasMore: !!r.hasMore, total: r.total == null ? null : r.total };
+  }
+  renderPicker(); renderNav();
+}
+
+let qTimer = null;
+$('#q').oninput = () => {
+  browse.q = $('#q').value;
+  clearTimeout(qTimer);
+  qTimer = setTimeout(filtersChanged, 350);
+};
+$('#q').onkeydown = (e) => { if (e.key === 'Enter') { clearTimeout(qTimer); filtersChanged(); } };
+$('#f-state').onchange = () => { browse.state = $('#f-state').value; filtersChanged(); };
+$('#f-industry').onchange = () => { browse.industry = $('#f-industry').value; filtersChanged(); };
+$('#f-owner').onchange = () => { browse.owner = $('#f-owner').value; filtersChanged(); };
+$('#f-profiled').onchange = () => { browse.profiled = $('#f-profiled').value; filtersChanged(); };
+$('#f-sort').onchange = () => {
+  const v = $('#f-sort').value.split(':');
+  browse.sort = v[0]; browse.order = v[1] || 'desc';
+  browse.page = 1; browseFetch();
+};
+$('#f-clear').onclick = () => {
+  browse.q = ''; browse.state = ''; browse.industry = ''; browse.owner = '';
+  browse.profiled = 'any'; browse.sort = 'created'; browse.order = 'desc';
+  browse.page = 1; browse.where = ''; chosenSeg = null;
+  syncFilterInputs(); renderSegs(); browseFetch();
+};
+
+function fillSelect(sel, values, placeholder) {
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">' + placeholder + '</option>' +
+    values.map((v) => '<option value="' + esc(v.value) + '">' + esc(v.label) + '</option>').join('');
+  sel.value = cur;
+}
+
+async function loadMeta() {
+  if (!direct()) return;
+  zohoMeta = await api('/api/zoho/meta');
+  fillSelect($('#f-state'), (zohoMeta.states || []).map((v) => ({ value: v, label: v })), 'Any state');
+  fillSelect($('#f-industry'), (zohoMeta.industries || []).map((v) => ({ value: v, label: v })), 'Any industry');
+  fillSelect($('#f-owner'), (zohoMeta.owners || []).map((o) => ({ value: o.id, label: o.name })), 'Any owner');
+  syncFilterInputs();
+}
+
+async function initZoho() {
+  try { zohoState = await api('/api/zoho/status'); }
+  catch { zohoState = { configured: false, ok: false, error: 'Could not reach the server.' }; }
+  $('#load').style.display = direct() ? 'none' : '';
+  // Dead controls are worse than absent ones — the filter row only works direct.
+  ['#q', '#f-state', '#f-industry', '#f-owner', '#f-profiled', '#f-sort', '#f-clear']
+    .forEach((s) => { $(s).disabled = !direct(); });
+  // A pinned user has exactly one owner, so the dropdown would be noise.
+  $('#f-owner').style.display = (S.scope && S.scope.lockOwner) ? 'none' : '';
+  if (isAdmin()) renderZoho();
+  renderPicker();
+  if (direct()) { await loadMeta(); browseFetch(); }
+  else {
+    chosenSeg = chosenSeg || (S.segments[0] && S.segments[0].id) || null;
+    renderSegs();
+    $('#run-banner').innerHTML = '<div class="banner warn"><b>Zoho isn\'t connected, so browsing falls back to a Claude session.</b><br>' +
+      'Pick a segment preset and press <b>Load leads via Claude</b>. That costs credits and takes a minute. ' +
+      (isAdmin() ? 'Connect Zoho under <button class="link" onclick="go(\'setup\')">Setup</button> to browse, search and filter instantly instead.'
+        : 'Ask your admin to connect Zoho so browsing is instant instead.') + '</div>';
+  }
+}
+
+$('#load').onclick = async () => {
+  const btn = $('#load'); btn.disabled = true; btn.textContent = 'Loading…';
+  setDot('busy', 'Querying Zoho…');
+  $('#run-banner').innerHTML = '';
+  const r = await api('/api/fetch-leads', { segmentId: chosenSeg });
+  btn.disabled = false; btn.textContent = 'Load leads via Claude';
+  setDot('live', 'Idle.');
+  if (r.error) {
+    $('#run-banner').innerHTML = '<div class="banner bad"><b>Could not load leads.</b><br>' + esc(r.error) + '</div>';
+    return;
+  }
+  S.leads = r.leads; picked.clear();
+  $('#load-note').textContent = r.leads.length + ' lead' + (r.leads.length === 1 ? '' : 's') + ' loaded.';
+  renderPicker(); renderNav();
+};
+
+/* ---------------------------------------------------------- run: picker */
+function sortableTh(key, label, cls) {
+  const on = browse.sort === key;
+  return '<th class="sortable ' + (cls || '') + '" data-sort="' + key + '">' + label +
+    (on ? ' <span class="arw">' + (browse.order === 'asc' ? '▲' : '▼') + '</span>' : '') + '</th>';
+}
+
+function renderPicker() {
+  const host = $('#picker');
+  if (S.run && !S.run.finishedAt) { host.innerHTML = ''; return; }
+  if (!direct() && !S.leads.length) { host.innerHTML = ''; return; }
+
+  const from = direct() ? (browse.page - 1) * browse.per + 1 : 1;
+  const to = direct() ? (browse.page - 1) * browse.per + S.leads.length : S.leads.length;
+
+  const rows = S.leads.map((l) =>
+    '<tr class="pick" data-id="' + esc(l.id) + '">' +
+      '<td><input type="checkbox" data-id="' + esc(l.id) + '" ' + (picked.has(l.id) ? 'checked' : '') + '/></td>' +
+      '<td><b>' + esc(l.company) + '</b>' + (l.status ? '<br><span class="muted tiny">' + esc(l.status) + '</span>' : '') + '</td>' +
+      '<td class="muted tiny">' + esc([l.city, l.state].filter(Boolean).join(', ') || '—') + '</td>' +
+      '<td class="tiny">' + (l.contact ? esc(l.contact) + (l.title ? '<br><span class="muted">' + esc(l.title) + '</span>' : '') : '<span class="muted">—</span>') + '</td>' +
+      '<td class="muted tiny">' + esc(l.industry || '—') + '</td>' +
+      '<td class="num tiny">' + (l.employees == null ? '—' : l.employees) + '</td>' +
+      '<td class="muted tiny">' + esc(String(l.created || '').slice(0, 10) || '—') + '</td>' +
+      '<td class="muted tiny">' + (l.profiledDate ? esc(String(l.profiledDate).slice(0, 10)) : 'never') + '</td></tr>').join('');
+
+  host.innerHTML =
+    '<div class="card" style="padding:0">' +
+      '<div class="tablebar">' +
+        (fetching ? '<span class="spin"></span>' : '') +
+        '<span>' + (fetching ? 'Reading Zoho…' : (S.leads.length ? 'Showing ' + from + '–' + to : 'No leads match that.')) + '</span>' +
+        '<span id="pickchip" style="margin-left:auto"></span>' +
+      '</div>' +
+      '<table><thead><tr>' +
+        '<th style="width:34px"><input type="checkbox" id="all" title="Select all on this page"/></th>' +
+        sortableTh('company', 'Company') +
+        '<th>Where</th><th>On record</th><th>Industry</th>' +
+        sortableTh('employees', 'Emp', 'num') +
+        sortableTh('created', 'Added') +
+        '<th>Last profiled</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table>' +
+      (S.leads.length ? '' : '<div class="empty">Nothing here. Widen the filters or clear the search.</div>') +
+      (direct() ?
+        '<div class="pager">' +
+          '<button class="btn sm" id="prev"' + (browse.page <= 1 ? ' disabled' : '') + '>Previous</button>' +
+          '<button class="btn sm" id="next"' + (pageInfo.hasMore ? '' : ' disabled') + '>Next</button>' +
+          '<span>Page ' + browse.page + '</span>' +
+          '<span style="margin-left:auto">Per page</span>' +
+          '<select id="per" style="background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:4px 7px;border-radius:7px">' +
+            [25, 50, 100].map((v) => '<option value="' + v + '"' + (browse.per === v ? ' selected' : '') + '>' + v + '</option>').join('') +
+          '</select>' +
+        '</div>' : '') +
+    '</div>' +
+    '<div class="bar-sticky"><button class="btn primary" id="start" disabled>Profile 0 leads</button>' +
+    '<span class="muted tiny" id="est"></span></div>';
+
+  const sync = () => {
+    const c = picked.size;
+    const b = $('#start');
+    b.disabled = !c; b.textContent = 'Profile ' + c + ' lead' + (c === 1 ? '' : 's');
+    const conc = S.config.concurrency || 3;
+    $('#est').textContent = c ? '~' + Math.ceil(c / conc) * 8 + '–' + Math.ceil(c / conc) * 15 + ' min at ' + conc + ' at a time' : '';
+    // The header box only ever speaks for the rows currently on screen.
+    $('#all').checked = S.leads.length > 0 && S.leads.every((l) => picked.has(l.id));
+    $('#nb-run').textContent = c ? c + ' picked' : (S.leads.length || '—');
+    // The chip is the only honest count once a selection spans several pages.
+    $('#pickchip').innerHTML = c
+      ? '<span class="chip">' + c + ' selected<button class="link" id="clear-pick">clear</button></span>' : '';
+    const cl = $('#clear-pick');
+    if (cl) cl.onclick = (e) => { e.stopPropagation(); picked.clear(); renderPicker(); };
+  };
+  const toggle = (cb) => {
+    const lead = S.leads.find((l) => l.id === cb.dataset.id);
+    if (cb.checked && lead) picked.set(lead.id, lead); else picked.delete(cb.dataset.id);
+    sync();
+  };
+  $$('#picker tbody input').forEach((cb) => cb.onclick = (e) => { e.stopPropagation(); toggle(cb); });
+  $$('#picker tbody tr').forEach((tr) => tr.onclick = () => { const cb = $('input', tr); cb.checked = !cb.checked; toggle(cb); });
+  $('#all').onclick = () => {
+    const on = $('#all').checked;
+    S.leads.forEach((l) => { if (on) picked.set(l.id, l); else picked.delete(l.id); });
+    $$('#picker tbody input').forEach((cb) => cb.checked = picked.has(cb.dataset.id));
+    sync();
+  };
+  $$('#picker th.sortable').forEach((th) => th.onclick = () => {
+    const k = th.dataset.sort;
+    if (browse.sort === k) browse.order = browse.order === 'asc' ? 'desc' : 'asc';
+    else { browse.sort = k; browse.order = k === 'company' ? 'asc' : 'desc'; }
+    browse.page = 1;
+    $('#f-sort').value = browse.sort + ':' + browse.order;
+    browseFetch();
+  });
+  if ($('#prev')) $('#prev').onclick = () => { if (browse.page > 1) { browse.page--; browseFetch(); } };
+  if ($('#next')) $('#next').onclick = () => { if (pageInfo.hasMore) { browse.page++; browseFetch(); } };
+  if ($('#per')) $('#per').onchange = () => { browse.per = Number($('#per').value) || 50; browse.page = 1; browseFetch(); };
+  $('#start').onclick = async () => {
+    $('#start').disabled = true;
+    const r = await api('/api/run', { leads: Array.from(picked.values()), pepm: Number($('#pepm').value) || S.config.pepm });
+    if (r.error) { $('#run-banner').innerHTML = '<div class="banner bad">' + esc(r.error) + '</div>'; $('#start').disabled = false; }
+  };
+  sync();
+}
+
+/* ---------------------------------------------------------- run: live */
+function renderLive() {
+  const host = $('#live');
+  if (!S.run) { host.innerHTML = ''; return; }
+  const jobs = S.run.jobs;
+  const done = jobs.filter((j) => j.result || j.status === 'failed').length;
+  const running = jobs.some((j) => j.status === 'running' || j.status === 'writing');
+  setDot(running ? 'busy' : 'live', running ? 'Working — ' + done + '/' + jobs.length + ' done' : 'Idle.');
+
+  host.innerHTML =
+    '<h2>Run ' + esc(S.run.id) + ' — ' + done + '/' + jobs.length + ' finished</h2>' +
+    (S.run.restored ? '<p class="muted tiny" style="margin:-6px 0 12px">Restored from ' + new Date(S.run.startedAt).toLocaleString() + ' — your last run, brought back after the server restarted. Anything not yet written is still waiting in Review.</p>' : '') +
+    jobs.map(renderJob).join('') +
+    (S.run.finishedAt ? '<div class="bar-sticky"><button class="btn primary" onclick="go(\'review\')">Review ' + done + ' result' + (done === 1 ? '' : 's') + '</button></div>' : '');
+}
+
+function renderJob(j) {
+  const icon = (j.status === 'running' || j.status === 'writing') ? '<span class="spin"></span>'
+    : j.status === 'queued' ? '<span class="dot"></span>'
+    : j.status === 'failed' ? '<span class="pill bad">failed</span>'
+    : '<span class="pill ok">done</span>';
+  const feed = (j.progress || []).slice(-6).map((p) =>
+    '<div class="' + esc(p.kind) + '">' + (p.kind === 'tool' ? '› ' : '') + esc(p.msg) + '</div>').join('');
+  const mins = j.startedAt ? Math.round(((j.finishedAt || Date.now()) - j.startedAt) / 60000) : 0;
+  return '<div class="job"><div class="job-head">' + icon +
+    '<b>' + esc(j.company) + '</b><span class="muted tiny">' + esc(j.status) +
+    (j.startedAt ? ' · ' + mins + 'm · ' + j.toolCalls + ' calls' : '') +
+    (j.cost ? ' · $' + j.cost.toFixed(2) : '') + '</span></div>' +
+    (j.error ? '<div class="feed" style="color:var(--bad)">' + esc(j.error) + '</div>' : (feed ? '<div class="feed">' + feed + '</div>' : '')) +
+    '</div>';
+}
+
+/* ---------------------------------------------------------- review */
+function renderReview() {
+  const host = $('#review-body');
+  const jobs = ((S.run && S.run.jobs) || []).filter((j) => j.result);
+  if (!jobs.length) { host.innerHTML = '<div class="empty">No results yet. Start a run first.</div>'; return; }
+
+  // A lead with no company description needs a human before it is written — that
+  // field is required and a recent run shipped without it.
+  const noDesc = (j) => !(j.result.fields && String(j.result.fields.Description || '').trim());
+  const flagged = jobs.filter((j) => j.result.needsHuman || j.result.contactChanged || noDesc(j));
+  host.innerHTML =
+    (flagged.length ? '<div class="banner warn"><b>' + flagged.length + ' need' + (flagged.length === 1 ? 's' : '') +
+      ' your eyes before writing.</b><br>' + flagged.map((j) =>
+        esc(j.company) + ' — ' + esc(j.result.needsHuman
+          || (!(j.result.fields && String(j.result.fields.Description || '').trim()) ? 'no company description was written' : '')
+          || 'the contact on the record was replaced')).join('<br>') + '</div>' : '') +
+    '<div class="card" style="padding:0"><table><thead><tr>' +
+      '<th style="width:34px"></th><th>Company</th><th>Decision-maker</th>' +
+      '<th class="num">Emp</th><th>Phone</th><th>Likely provider</th>' +
+      '<th class="num">2nd contact</th><th></th></tr></thead><tbody>' +
+    jobs.map(reviewRow).join('') + '</tbody></table></div>' +
+    '<div class="bar-sticky"><button class="btn primary" id="write" disabled>Write 0 to Zoho</button>' +
+    '<button class="btn ghost sm" id="approve-all">Approve all clean</button>' +
+    '<span class="muted tiny" id="write-note"></span></div>' +
+    '<p class="muted tiny" style="margin:8px 0 0">' + writePathLine() + '</p>';
+
+  $$('#review-body tbody input[type=checkbox]').forEach((cb) => cb.onclick = () => {
+    cb.checked ? approved.add(cb.dataset.id) : approved.delete(cb.dataset.id);
+    syncWrite();
+  });
+  $$('#review-body .toggle').forEach((b) => b.onclick = () => {
+    open.has(b.dataset.id) ? open.delete(b.dataset.id) : open.add(b.dataset.id);
+    renderReview();
+  });
+  $('#approve-all').onclick = () => {
+    // "Clean" now also means it has a company description. Approving a lead without
+    // one is how the last run put an undescribed company into the CRM.
+    jobs.forEach((j) => {
+      const missingDesc = !(j.result.fields && String(j.result.fields.Description || '').trim());
+      if (!j.result.needsHuman && !j.result.disqualified && !j.written && !missingDesc) approved.add(j.leadId);
+    });
+    renderReview();
+  };
+  $('#write').onclick = async () => {
+    $('#write').disabled = true;
+    const r = await api('/api/write', { leadIds: Array.from(approved) });
+    $('#write-note').textContent = r.error ? r.error : 'Writing ' + r.queued + '…';
+    approved.clear();
+  };
+  syncWrite();
+}
+
+// Which of the two write paths is live. Worth saying out loud: the Claude one
+// silently does nothing unless that CLI has a Zoho connector attached.
+function writePathLine() {
+  const z = zohoState;
+  if (z && z.configured && z.ok) return 'Writes go straight to Zoho over the connection set up in Setup — no Claude session, no credits, near instant.';
+  const fix = isAdmin() ? 'Fix it under <button class="link" onclick="go(\'setup\')">Setup</button> first.' : 'Ask your admin to fix it first.';
+  if (z && z.configured) return 'Zoho is saved but the connection is failing right now, so the write will not go through. ' + fix;
+  return 'Zoho is not connected, so the write falls back to a Claude session — which only works if the server\'s Claude account has a Zoho connector. ' + (isAdmin() ? 'Connect Zoho under <button class="link" onclick="go(\'setup\')">Setup</button> to write directly instead.' : 'Ask your admin to connect Zoho.');
+}
+
+function syncWrite() {
+  const b = $('#write'); if (!b) return;
+  b.disabled = !approved.size;
+  b.textContent = 'Write ' + approved.size + ' to Zoho';
+}
+
+function reviewRow(j) {
+  const r = j.result, c = r.contact || {};
+  const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || '—';
+  const vflag = c.employmentVerifiedBy ? '<span class="pill ok">verified</span>' : '<span class="pill flag">unverified</span>';
+  const isOpen = open.has(j.leadId);
+  return '<tr>' +
+    '<td>' + (j.written ? '<span class="pill ok">✓</span>'
+      : '<input type="checkbox" data-id="' + esc(j.leadId) + '" ' + (approved.has(j.leadId) ? 'checked' : '') + '/>') + '</td>' +
+    '<td><b>' + esc(j.company) + '</b>' + (r.disqualified ? '<br><span class="pill bad">DQ</span> <span class="muted tiny">' + esc(r.disqualified) + '</span>' : '') +
+      (!(r.fields && String(r.fields.Description || '').trim()) ? '<br><span class="pill bad">no description</span>' : '') +
+      (!Object.keys(r.notes || {}).some((k) => k.toUpperCase().indexOf('FINDING') >= 0) ? '<br><span class="pill flag">no findings note</span>' : '') + '</td>' +
+    '<td class="tiny">' + esc(name) + '<br><span class="muted">' + esc(c.title || '') + '</span> ' + vflag +
+      (r.contactChanged ? '<br><span class="pill flag">replaced</span>' : '') + '</td>' +
+    '<td class="num tiny">' + (r.employees == null ? '—' : r.employees) + (r.employeesBasis === 'estimate' ? '<span class="muted">e</span>' : '') +
+      ((r.entities || []).length > 1 ? '<br><span class="pill cool">' + (r.entities || []).length + ' entities</span>' : '') + '</td>' +
+    '<td class="tiny">' + esc(c.directPhone || c.mobilePhone || '') +
+      (!c.directPhone && !c.mobilePhone ? '<span class="pill flag">none for the owner</span>' : '') + '</td>' +
+    '<td class="tiny" style="max-width:240px">' + esc((r.fields && r.fields.Current_PR_Provider_new) || '') + '</td>' +
+    '<td class="num tiny">' + ((r.additionalContacts || []).length || '') + '</td>' +
+    '<td><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen ? 'hide' : 'open') + '</button></td></tr>' +
+    (isOpen ? '<tr><td colspan="8" style="padding:0"><div class="detail">' + detail(j) + '</div></td></tr>' : '');
+}
+
+// What actually landed in the CRM, in the words Zoho used. A half-written record
+// says "partial" and still lists what got there — "failed" would send someone
+// hunting for changes that are already in the record.
+function writeResultHtml(w) {
+  const fields = w.fieldsWritten || [], notes = w.notesWritten || [], skipped = w.skipped || [];
+  const pill = w.ok ? '<span class="pill ok">written</span>'
+    : w.partial ? '<span class="pill flag">partial</span>'
+    : '<span class="pill bad">failed</span>';
+  const lines = [];
+  lines.push(fields.length ? '<b>' + fields.length + ' field' + (fields.length === 1 ? '' : 's') + '</b> — ' +
+    fields.map((f) => '<code>' + esc(f) + '</code>').join(' ') : 'No fields written.');
+  lines.push(notes.length ? '<b>' + notes.length + ' note' + (notes.length === 1 ? '' : 's') + '</b> — ' +
+    notes.map(esc).join(', ') : 'No notes written.');
+
+  const warnings = w.warnings || [];
+  if (warnings.length) lines.push(warnings.map((x) =>
+    '<span style="color:var(--warn)"><b>Check this:</b> ' + esc(x) + '</span>').join('<br>'));
+  if (skipped.length) lines.push('<span class="muted">Skipped: ' + skipped.map(esc).join('<br>Skipped: ') + '</span>');
+  if (w.error) lines.push('<span style="color:var(--bad)">' + esc(w.error) + '</span>');
+  return pill + '<div class="tiny" style="margin-top:4px;line-height:1.6">' + lines.join('<br>') + '</div>';
+}
+
+function detail(j) {
+  const r = j.result, c = r.contact || {}, w = j.writeResult;
+  const ph = (v, ver, dnc) => v ? esc(v) + ' ' + (ver ? '<span class="pill ok">verified</span>' : '<span class="pill flag">unverified</span>') +
+    (dnc ? ' <span class="pill bad">DNC</span>' : '') : '—';
+  const notes = Object.entries(r.notes || {}).filter((e) => e[1] && String(e[1]).trim());
+  return '<dl class="kv">' +
+    '<dt>Contact</dt><dd>' + esc([c.firstName, c.lastName].filter(Boolean).join(' ') || '—') + ' — ' + esc(c.title || '') +
+      ' <span class="muted tiny">(priority ' + (c.priority == null ? '?' : c.priority) + ')</span></dd>' +
+    '<dt>Verified by</dt><dd>' + esc(c.employmentVerifiedBy || '—') + '</dd>' +
+    '<dt>Email</dt><dd>' + ph(c.email, c.emailVerified) + '</dd>' +
+    '<dt>Direct</dt><dd>' + ph(c.directPhone, c.directPhoneVerified, c.directPhoneDNC) + '</dd>' +
+    '<dt>Mobile</dt><dd>' + ph(c.mobilePhone, c.mobilePhoneVerified, c.mobilePhoneDNC) + '</dd>' +
+    ((r.entities || []).length > 1 ? '<dt>Legal entities</dt><dd>' + (r.entities || []).map((e) =>
+      esc([e.name, e.state, e.role].filter(Boolean).join(' \u00b7 ')) +
+      ' — ' + (e.employees == null || e.employees === '' ? '<span style="color:var(--warn)">headcount not established</span>' : esc(String(e.employees)) + ' employees') +
+      (e.ein ? ' <span class="muted">(employer ID ' + esc(e.ein) + ')</span>' : '')
+    ).join('<br>') + '<br><b>Total: ' + (r.entities || []).reduce((n, e) =>
+      n + (e.employees == null || e.employees === '' || !isFinite(Number(e.employees)) ? 0 : Number(e.employees)), 0) +
+      ' employees</b></dd>' : '') +
+    '<dt>Company description</dt><dd>' + ((r.fields && r.fields.Description)
+      ? esc(r.fields.Description).replace(/\n/g, '<br>')
+      : '<span style="color:var(--bad)">Missing — this field is required on every lead.</span>') + '</dd>' +
+    '<dt>Likely provider</dt><dd>' + esc((r.fields && r.fields.Current_PR_Provider_new) || '—') + '</dd>' +
+    '<dt>Additional contacts</dt><dd>' + ((r.additionalContacts || []).map((a) =>
+      esc([a.firstName, a.lastName].filter(Boolean).join(' ')) +
+      (a.title ? ' <span class="muted">' + esc(a.title) + '</span>' : '') +
+      (a.directPhone ? ' · ' + esc(a.directPhone) : '') +
+      (a.email ? ' · ' + esc(a.email) : '') +
+      (a.reason ? ' <span class="pill cool">' + esc(a.reason) + '</span>' : '')
+    ).join('<br>') || '—') + '</dd>' +
+    (r.needsHuman ? '<dt style="color:var(--warn)">Needs a human</dt><dd>' + esc(r.needsHuman) + '</dd>' : '') +
+    (w ? '<dt>Write result</dt><dd>' + writeResultHtml(w) + '</dd>' : '') +
+    '</dl>' +
+    '<div style="font-size:11px;letter-spacing:.06em;color:var(--dim2);margin-bottom:8px">NOTES THAT WOULD BE WRITTEN</div>' +
+    (notes.map((e) => '<div class="note"><b>' + esc(e[0]) + '</b><pre>' + esc(e[1]) + '</pre></div>').join('') || '<div class="muted tiny">No notes.</div>');
+}
+
+/* ---------------------------------------------------------- stats */
+let statsScope = 'mine';
+$$('#stats-scope button').forEach((b) => b.onclick = async () => {
+  statsScope = b.dataset.scope;
+  $$('#stats-scope button').forEach((x) => x.classList.toggle('on', x === b));
+  S.stats = await api('/api/stats?scope=' + statsScope);
+  $('#stats-sub').textContent = statsScope === 'all'
+    ? 'Across every run by everyone on the team. The by-person table is who has been profiling what.'
+    : 'Across every run you have done. The coverage bars are the ones to watch — they show what the research actually manages to find.';
+  renderStats();
+});
+
+function renderStats() {
+  const s = S.stats, host = $('#stats-body');
+  if (!s || !s.totalLeads) { host.innerHTML = '<div class="empty">Nothing yet. Stats build up as you run batches.</div>'; return; }
+  const people = (s.byPerson || []);
+  const peopleHtml = (s.scope === 'all' && people.length)
+    ? '<h2>By person</h2><div class="card" style="padding:0"><table>' +
+      '<thead><tr><th>Person</th><th class="num">Runs</th><th class="num">Leads profiled</th><th class="num">Written</th><th class="num">Cost</th><th>Last run</th></tr></thead><tbody>' +
+      people.map((p) => '<tr><td><b>' + esc(p.name) + '</b></td><td class="num tiny">' + p.runs + '</td><td class="num tiny">' + p.leads + '</td>' +
+        '<td class="num tiny">' + p.written + '</td><td class="num tiny">$' + (p.cost || 0).toFixed(2) + '</td>' +
+        '<td class="muted tiny">' + (p.lastRun ? new Date(p.lastRun).toLocaleDateString() : '—') + '</td></tr>').join('') +
+      '</tbody></table></div>' : '';
+
+  // Coverage, not scoring. These bars answer "is the research working" — how often
+  // it comes back with a phone, an email, a provider — rather than rating the lead,
+  // which is the rep's call and not something a bot should be pronouncing on.
+  const COV_LABELS = {
+    directPhone: 'direct phone or mobile',
+    email: 'email',
+    provider: 'payroll provider',
+    headcount: 'sourced headcount',
+    socialIcebreaker: 'icebreaker from social',
+    publicRecord: 'public-record hit',
+  };
+  const cov = Object.entries(s.coverage || {}).sort((a, b) => b[1].rate - a[1].rate);
+  const prov = Object.entries(s.providerCounts || {}).sort((a, b) => b[1] - a[1]).slice(0, 12);
+  const maxProv = Math.max.apply(null, [1].concat(prov.map((e) => e[1])));
+  const verts = Object.entries(s.byVertical).sort((a, b) => b[1].n - a[1].n);
+  const maxVert = Math.max.apply(null, [1].concat(verts.map((e) => e[1].n)));
+
+  host.innerHTML =
+    '<div class="tiles">' +
+      tile(s.totalLeads, 'leads profiled', s.totalRuns + ' run' + (s.totalRuns === 1 ? '' : 's') + ', ' + s.writtenCount + ' written to Zoho') +
+      tile(pct((s.coverage.directPhone || {}).rate || 0), 'reached by phone', (s.coverage.directPhone || {}).n + ' of ' + s.totalLeads + ' came back with a direct dial or mobile') +
+      tile(pct((s.coverage.provider || {}).rate || 0), 'provider identified', 'A hypothesis with a source behind it, not a guess') +
+      tile(pct((s.coverage.socialIcebreaker || {}).rate || 0), 'social icebreaker', "At least one from the person's own account") +
+      tile(s.contactChanged, 'contacts replaced', "The record's person had left or was the wrong seat") +
+      tile(s.secondContactAdded, 'second contact added', 'Mostly where the owner had no reachable number') +
+      tile('$' + s.avgCost.toFixed(2), 'avg cost per lead', money(s.totalCost) + ' total \u00b7 ' + s.avgMinutes.toFixed(0) + ' min each') +
+      tile(s.disqualified, 'disqualified', 'Dissolved, already a client, or under a PEO') +
+    '</div>' +
+    peopleHtml +
+
+    '<h2>What the research actually finds</h2><div class="card"><div class="bars">' +
+    (cov.map((e) => barRow(COV_LABELS[e[0]] || e[0], e[1].rate, pct(e[1].rate) + ' (' + e[1].n + ')')).join('') || '<div class="muted tiny">Nothing recorded yet.</div>') +
+    '</div><p class="muted tiny" style="margin:14px 0 0">A low bar here is a research problem, not a lead-quality problem \u2014 it means the escalation ladder for that gap is not paying off and is worth changing.</p></div>' +
+
+    '<h2>Incumbent providers seen</h2><div class="card"><div class="bars">' +
+    (prov.map((e) => barRow(esc(e[0]), e[1] / maxProv, e[1])).join('') || '<div class="muted tiny">No provider identified yet.</div>') +
+    '</div><p class="muted tiny" style="margin:14px 0 0">Who you are actually displacing, counted across every run.</p></div>' +
+
+    '<h2>Coverage by vertical</h2><div class="card"><div class="bars">' +
+    verts.map((e) => barRow(esc(e[0]) + ' <span class="muted tiny">' + e[1].withPhone + ' phone \u00b7 ' + e[1].withProvider + ' provider \u00b7 ' + e[1].withSocial + ' social</span>', e[1].n / maxVert, e[1].n, true)).join('') +
+    '</div></div>' +
+
+    '<h2>Recent runs</h2><div class="card" style="padding:0"><table>' +
+    '<thead><tr><th>Run</th><th>Who</th><th>When</th><th class="num">Leads</th><th class="num">Done</th><th class="num">Written</th></tr></thead><tbody>' +
+    s.recentRuns.map((r) => '<tr><td class="tiny">' + esc(r.id) + '</td><td class="tiny">' + esc(r.userName || '—') + '</td>' +
+      '<td class="muted tiny">' + new Date(r.at).toLocaleString() + '</td>' +
+      '<td class="num tiny">' + r.n + '</td><td class="num tiny">' + r.done + '</td>' +
+      '<td class="num tiny">' + r.written + '</td></tr>').join('') +
+    '</tbody></table></div>';
+}
+const tile = (n, l, h) => '<div class="tile"><div class="n">' + n + '</div><div class="l">' + l + '</div><div class="h">' + h + '</div></div>';
+const barRow = (label, frac, val, raw) => '<div class="bar"><span>' + (raw ? label : esc(label)) + '</span>' +
+  '<span class="track"><span class="fill" style="width:' + (frac * 100).toFixed(1) + '%"></span></span>' +
+  '<span class="v">' + val + '</span></div>';
+
+/* ---------------------------------------------------------- segment editor */
+function renderSegEditor() {
+  $('#seg-editor').innerHTML = S.segments.map((s, i) =>
+    '<div class="card" style="margin-bottom:12px">' +
+      '<div class="segs" style="grid-template-columns:1fr 1fr">' +
+        '<div class="field"><label>Name</label><input data-i="' + i + '" data-k="name" value="' + esc(s.name) + '"/></div>' +
+        '<div class="field"><label>Limit</label><input data-i="' + i + '" data-k="limit" type="number" value="' + (s.limit || 25) + '"/></div>' +
+      '</div>' +
+      '<div class="field" style="margin-top:10px"><label>Note to self</label><input data-i="' + i + '" data-k="note" value="' + esc(s.note || '') + '"/></div>' +
+      '<div class="field" style="margin-top:10px"><label>COQL where clause</label><textarea data-i="' + i + '" data-k="where" rows="2">' + esc(s.where) + '</textarea></div>' +
+      '<div class="row" style="margin-top:10px"><button class="btn sm ghost" data-del="' + i + '">Delete</button></div>' +
+    '</div>').join('');
+  $$('#seg-editor [data-k]').forEach((el) => el.oninput = () => {
+    const s = S.segments[Number(el.dataset.i)];
+    s[el.dataset.k] = el.dataset.k === 'limit' ? Number(el.value) : el.value;
+  });
+  $$('#seg-editor [data-del]').forEach((b) => b.onclick = () => {
+    S.segments.splice(Number(b.dataset.del), 1); renderSegEditor(); renderSegs();
+  });
+}
+$('#seg-add').onclick = () => {
+  S.segments.push({ id: 'seg-' + Date.now(), name: 'New segment', note: '', where: "(State = 'NY')", limit: 25 });
+  renderSegEditor();
+};
+$('#seg-save').onclick = async () => {
+  await api('/api/segments', { segments: S.segments });
+  $('#seg-note').textContent = 'Saved.';
+  setTimeout(() => { $('#seg-note').textContent = ''; }, 2000);
+  renderSegs();
+};
+
+/* ---------------------------------------------------------- connection */
+let conn = null;
+function renderConn() {
+  const c = conn;
+  const servers = c && c.mcp && c.mcp.out ? c.mcp.out.split('\n').map((l) => l.trim()).filter((l) => l && !/^Checking|^$/.test(l)) : [];
+  const has = (n) => servers.some((s) => s.toLowerCase().includes(n));
+  $('#conn-body').innerHTML = '<div class="card">' +
+    (!c ? '<p class="muted" style="margin:0 0 14px">Not checked yet.</p>'
+      : !c.cli.ok
+        ? '<div class="banner bad" style="margin:0 0 14px"><b>Claude Code isn\'t reachable on the server.</b><br>' +
+          '<span class="muted tiny">' + esc(c.cli.out || 'command not found') + '</span><br><br>' +
+          'The container image should have the Claude Code CLI installed; check the deploy logs and the command in Settings below.</div>'
+        : '<div class="row" style="margin-bottom:12px">' +
+          (c.tokenSet ? '<span class="pill ok">token set</span>' : '<span class="pill bad">no token</span>') +
+          '<b>Claude Code ' + esc(c.cli.out.split('\n')[0]) + '</b>' +
+          '<span class="muted tiny">' + (c.tokenSet
+            ? 'signed in through CLAUDE_CODE_OAUTH_TOKEN — one shared account does all the work; ' + c.liveSessions + ' of ' + c.maxSessions + ' sessions live now'
+            : 'set CLAUDE_CODE_OAUTH_TOKEN in the server environment (run <code>claude setup-token</code> on a signed-in machine to get one)') + '</span></div>' +
+          '<div style="font-size:11px;letter-spacing:.06em;color:var(--dim2);margin:16px 0 8px">CONNECTORS THIS ACCOUNT HAS</div>' +
+          (servers.length
+            ? '<div class="feed" style="border:1px solid var(--line);border-radius:8px;max-height:190px">' +
+              servers.map((s) => '<div>' + esc(s) + '</div>').join('') + '</div>'
+            : '<p class="muted tiny" style="margin:0">No MCP servers configured on this account yet.</p>') +
+          '<div class="row" style="margin-top:12px">' +
+          (has('zoho') ? '<span class="pill ok">Zoho</span>' : '<span class="pill bad">Zoho missing</span>') +
+          (has('zoominfo') ? '<span class="pill ok">ZoomInfo</span>' : '<span class="pill flag">ZoomInfo missing</span>') +
+          '<span class="muted tiny">Zoho is required. Without ZoomInfo the profiler falls back to web research only.</span></div>') +
+    '<div class="row" style="margin-top:16px">' +
+      '<button class="btn primary" id="conn-check">Check connection</button>' +
+      '<span class="muted tiny" id="conn-note"></span>' +
+    '</div>' +
+    '<p class="muted tiny" style="margin:12px 0 0">To switch the account or change its connectors, generate a new token with <code>claude setup-token</code> on a machine signed in to the account you want, update <code>CLAUDE_CODE_OAUTH_TOKEN</code> on the server, and redeploy. Connectors attached to that claude.ai account come along with it — run Preflight below to confirm Zoho and ZoomInfo are visible.</p>' +
+    '</div>';
+  $('#conn-check').onclick = async () => {
+    $('#conn-note').textContent = 'Asking the CLI…';
+    conn = await api('/api/connection');
+    renderConn(); $('#conn-note').textContent = '';
+  };
+}
+
+/* ---------------------------------------------------------- team (admin) */
+let team = null;
+async function renderTeam() {
+  const host = $('#team-body');
+  if (!team) { host.innerHTML = '<p class="muted">Loading…</p>'; team = await api('/api/users'); }
+  const zu = team.zohoUsers || [];
+  $('#nb-team').textContent = (team.users || []).length;
+  const ownerOpts = (sel) => '<option value="">— not linked —</option>' +
+    zu.map((z) => '<option value="' + esc(z.id) + '" data-name="' + esc(z.name) + '"' + (String(sel) === String(z.id) ? ' selected' : '') + '>' + esc(z.name) + (z.email ? ' · ' + esc(z.email) : '') + '</option>').join('');
+  host.innerHTML =
+    '<div class="card" style="padding:0"><table><thead><tr>' +
+      '<th>Person</th><th>Role</th><th>Zoho user</th><th>Sees</th><th>Last sign-in</th><th></th></tr></thead><tbody>' +
+    (team.users || []).map((u) =>
+      '<tr data-id="' + esc(u.id) + '"' + (u.enabled ? '' : ' style="opacity:.5"') + '>' +
+        '<td><b>' + esc(u.name) + '</b><br><span class="muted tiny">' + esc(u.email) + (u.enabled ? '' : ' · disabled') + '</span></td>' +
+        '<td><select data-k="role" style="background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:4px 7px;border-radius:7px">' +
+          '<option value="user"' + (u.role === 'user' ? ' selected' : '') + '>rep</option><option value="admin"' + (u.role === 'admin' ? ' selected' : '') + '>admin</option></select></td>' +
+        '<td><select data-k="owner" style="background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:4px 7px;border-radius:7px;max-width:240px">' + ownerOpts(u.zohoOwnerId) + '</select></td>' +
+        '<td class="tiny"><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" data-k="seeAll"' + (u.seeAll || u.role === 'admin' ? ' checked' : '') + (u.role === 'admin' ? ' disabled' : '') + '/> whole org</label></td>' +
+        '<td class="muted tiny">' + (u.lastLogin ? new Date(u.lastLogin).toLocaleString() : 'never') + '</td>' +
+        '<td class="tiny" style="white-space:nowrap"><button class="link" data-act="pw">reset password</button> · ' +
+          '<button class="link" data-act="toggle">' + (u.enabled ? 'disable' : 'enable') + '</button> · ' +
+          '<button class="link" data-act="del" style="color:var(--bad)">delete</button></td></tr>').join('') +
+    '</tbody></table></div>' +
+    (zu.length ? '' : '<p class="muted tiny" style="margin:8px 0 0">Zoho users could not be listed (is Zoho connected?), so the owner mapping cannot be edited right now.</p>') +
+
+    '<h2>Add a person</h2><div class="card">' +
+      '<div class="segs" style="grid-template-columns:repeat(auto-fill,minmax(200px,1fr))">' +
+        '<div class="field"><label>Name</label><input id="t-name" /></div>' +
+        '<div class="field"><label>Email</label><input id="t-email" type="email" /></div>' +
+        '<div class="field"><label>Temporary password</label><input id="t-pw" placeholder="at least 8 characters" /></div>' +
+        '<div class="field"><label>Role</label><select id="t-role"><option value="user">rep</option><option value="admin">admin</option></select></div>' +
+        '<div class="field"><label>Zoho user</label><select id="t-owner">' + ownerOpts('') + '</select></div>' +
+      '</div>' +
+      '<div class="row" style="margin-top:14px"><button class="btn primary" id="t-add">Add</button><span class="muted tiny" id="t-note">If you leave the Zoho user blank, it is matched by email automatically when one exists.</span></div>' +
+    '</div>';
+
+  const patch = async (id, body) => {
+    const r = await api('/api/users/' + id, body);
+    if (r.error) { alert(r.error); return; }
+    team.users = r.users; renderTeam();
+  };
+  $$('#team-body tbody tr').forEach((tr) => {
+    const id = tr.dataset.id;
+    $('[data-k=role]', tr).onchange = (e) => patch(id, { role: e.target.value });
+    $('[data-k=seeAll]', tr).onchange = (e) => patch(id, { seeAll: e.target.checked });
+    $('[data-k=owner]', tr).onchange = (e) => {
+      const o = e.target.selectedOptions[0];
+      patch(id, { zohoOwnerId: e.target.value, zohoOwnerName: o ? o.dataset.name || '' : '' });
+    };
+    $('[data-act=pw]', tr).onclick = () => { const password = prompt('New password for this person (at least 8 characters)'); if (password) patch(id, { password }); };
+    $('[data-act=toggle]', tr).onclick = () => { const u = team.users.find((x) => x.id === id); patch(id, { enabled: !u.enabled }); };
+    $('[data-act=del]', tr).onclick = () => { const u = team.users.find((x) => x.id === id); if (confirm('Delete ' + u.email + '? Their past runs stay in Stats.')) patch(id, { delete: true }); };
+  });
+  $('#t-add').onclick = async () => {
+    const btn = $('#t-add'); if (btn.disabled) return; btn.disabled = true;
+    const o = $('#t-owner').selectedOptions[0];
+    const r = await api('/api/users', {
+      name: $('#t-name').value, email: $('#t-email').value, password: $('#t-pw').value, role: $('#t-role').value,
+      zohoOwnerId: $('#t-owner').value, zohoOwnerName: o ? o.dataset.name || '' : '',
+    });
+    if (r.error) { $('#t-note').textContent = r.error; btn.disabled = false; return; }
+    team.users = r.users; renderTeam();
+  };
+}
+
+/* ---------------------------------------------------------- zoho card */
+const ZOHO_DCS = [
+  ['com', 'zoho.com — US'], ['eu', 'zoho.eu — Europe'], ['in', 'zoho.in — India'],
+  ['com.au', 'zoho.com.au — Australia'], ['jp', 'zoho.jp — Japan'],
+  ['ca', 'zohocloud.ca — Canada'], ['sa', 'zoho.sa — Saudi Arabia'],
+];
+
+// Last read-only permission check, kept so a background re-render does not wipe
+// the answer the user just asked for.
+let zohoWrite = null;
+
+function writeCheckHtml(w) {
+  const miss = (w.customFields && w.customFields.missing) || [];
+  return '<div class="banner ' + (w.ok ? 'ok' : 'bad') + '" style="margin:12px 0 0">' +
+    '<b>' + (w.ok ? 'This connection can write to Leads.' : 'This connection may not be able to write.') + '</b><br>' +
+    (w.scope ? 'Granted scopes: <code>' + esc(w.scope) + '</code><br>' : '') +
+    (w.moduleEditable === false ? 'Zoho reports the Leads module as not editable for this user.<br>' : '') +
+    (w.error ? esc(w.error) + '<br>' : '') +
+    (w.ok ? '' : 'Writing needs <code>' + esc(w.required || '') + '</code>. Generate a new refresh token with that scope and paste it above.<br>') +
+    (miss.length ? '<span class="muted tiny">These profiler fields are not on your Leads layout, so they get skipped on every write and the findings stay in the notes: ' +
+      miss.map((f) => '<code>' + esc(f) + '</code>').join(' ') + '</span><br>' : '') +
+    '<span class="muted tiny">This check reads only — it cannot change a record.</span></div>';
+}
+
+function renderZoho() {
+  const z = zohoState;
+  const head = !z ? '<p class="muted" style="margin:0 0 14px">Checking…</p>'
+    : z.ok
+      ? '<div class="row" style="margin-bottom:12px"><span class="pill ok">connected</span>' +
+        '<b>' + esc((z.org && (z.org.company_name || z.org.primary_email)) || 'Zoho CRM') + '</b>' +
+        '<span class="muted tiny">reading leads straight from this org — no Claude session, no credits</span></div>'
+      : '<div class="banner ' + (z.configured ? 'bad' : 'warn') + '" style="margin:0 0 14px">' +
+        '<b>' + (z.configured ? 'Saved, but Zoho refused the connection.' : 'Not connected yet.') + '</b><br>' +
+        (z.configured ? esc(z.error || 'Unknown error.') :
+          'Until this is set up, the Run screen has to start a Claude session just to list leads. Fill this in once and browsing becomes instant and free.') +
+        '</div>';
+
+  $('#zoho-body').innerHTML = '<div class="card">' + head +
+    '<div class="segs" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr))">' +
+      '<div class="field"><label for="z-dc">Data centre</label><select id="z-dc">' +
+        ZOHO_DCS.map((d) => '<option value="' + d[0] + '"' + ((z && z.dc) === d[0] ? ' selected' : '') + '>' + esc(d[1]) + '</option>').join('') +
+      '</select></div>' +
+      '<div class="field"><label for="z-id">Client ID</label><input id="z-id" value="' + esc((z && z.clientId) || '') + '" placeholder="1000.XXXXXXXX" /></div>' +
+      '<div class="field"><label for="z-secret">Client Secret</label><input id="z-secret" type="password" placeholder="' +
+        esc((z && z.clientSecretMasked) || 'paste the secret') + '" /></div>' +
+      '<div class="field"><label for="z-token">Refresh Token</label><input id="z-token" type="password" placeholder="' +
+        esc((z && z.refreshTokenMasked) || '1000.xxxx.xxxx') + '" /></div>' +
+    '</div>' +
+    '<div class="row" style="margin-top:14px">' +
+      '<button class="btn primary" id="z-save">Save &amp; verify</button>' +
+      ((z && z.configured) ? '<button class="btn ghost sm" id="z-write">Test write access</button>' : '') +
+      '<span class="muted tiny" id="z-note"></span>' +
+    '</div>' +
+    '<div id="z-write-out">' + (zohoWrite ? writeCheckHtml(zohoWrite) : '') + '</div>' +
+    ((z && z.configured) ? '<p class="muted tiny" style="margin:10px 0 0">Leave the secret and token blank to keep the ones already saved.</p>' : '') +
+
+    '<details class="help"><summary>How to get these — one-time setup</summary><ol>' +
+      '<li>Sign in to the Zoho API Console at <a href="https://api-console.zoho.com" target="_blank" rel="noopener">api-console.zoho.com</a> with the same account that owns the CRM, and create a new client of the <b>Self Client</b> type. That gives you a Client ID and a Client Secret.</li>' +
+      '<li>Still in the console, use the Self Client to generate a one-time authorisation <b>code</b>, asking for the scopes <code>ZohoCRM.modules.ALL,ZohoCRM.settings.READ,ZohoCRM.users.READ,ZohoCRM.org.READ</code>. Codes are short-lived, so do the next step straight away.</li>' +
+      '<li>Exchange that code for a <b>refresh token</b> by POSTing it to your data centre\'s token endpoint with <code>grant_type=authorization_code</code>, your client ID and secret. The response contains <code>refresh_token</code> — that is the value to paste above.</li>' +
+      '<li>Paste all three here, choose the matching data centre, and press Save &amp; verify. Zoho\'s own walkthrough is at <a href="https://www.zoho.com/crm/developer/docs/api/v8/oauth-overview.html" target="_blank" rel="noopener">the OAuth overview</a>.</li>' +
+    '</ol>' +
+    '<p class="muted tiny" style="margin:10px 0 0">The refresh token does not expire on its own, but generating a new one invalidates the old one — so if browsing suddenly stops working, that is the first thing to check.</p>' +
+    '</details>' +
+
+    '<div class="warnbox"><b>Where these live.</b> ' + (z && z.fromEnv
+      ? 'They come from the server environment (<code>ZOHO_CLIENT_ID</code>, <code>ZOHO_CLIENT_SECRET</code>, <code>ZOHO_REFRESH_TOKEN</code>). Saving here overrides them on the storage volume until you clear the file. '
+      : 'Saving here writes them to the storage volume, in <code>data/zoho.json</code>. ') +
+    'The refresh token grants full access to the CRM, so treat it like a password.</div>' +
+    '</div>';
+
+  // Deliberately read-only: the granted scopes come back with the access token and
+  // the module check is a GET. Nothing here can change a record.
+  if ($('#z-write')) $('#z-write').onclick = async () => {
+    const btn = $('#z-write'); btn.disabled = true;
+    $('#z-write-out').innerHTML = '<p class="muted tiny" style="margin:10px 0 0">Asking Zoho what this token may do…</p>';
+    zohoWrite = await api('/api/zoho/write-check');
+    btn.disabled = false;
+    $('#z-write-out').innerHTML = writeCheckHtml(zohoWrite);
+  };
+
+  $('#z-save').onclick = async () => {
+    const btn = $('#z-save'); btn.disabled = true;
+    $('#z-note').textContent = 'Asking Zoho…';
+    zohoState = await api('/api/zoho/config', {
+      dc: $('#z-dc').value, clientId: $('#z-id').value.trim(),
+      clientSecret: $('#z-secret').value.trim(), refreshToken: $('#z-token').value.trim(),
+    });
+    btn.disabled = false;
+    renderZoho();
+    // A failed save already explains itself in the banner above; an incomplete
+    // one would otherwise look like the button did nothing at all.
+    $('#z-note').textContent = zohoState.ok ? 'Connected.'
+      : zohoState.configured ? '' : 'Still needs a client ID, a secret and a refresh token.';
+    $('#load').style.display = direct() ? 'none' : '';
+    ['#q', '#f-state', '#f-industry', '#f-owner', '#f-profiled', '#f-sort', '#f-clear']
+      .forEach((s) => { $(s).disabled = !direct(); });
+    if (direct()) { $('#run-banner').innerHTML = ''; await loadMeta(); browseFetch(); }
+  };
+}
+
+/* ---------------------------------------------------------- setup */
+function renderSetup() {
+  renderZoho();
+  renderConn();
+  const p = S.preflight;
+  const line = (ok, label, hint) =>
+    '<div class="row" style="margin-bottom:7px"><span class="pill ' + (ok ? 'ok' : 'bad') + '">' + (ok ? 'ok' : 'missing') +
+    '</span><b>' + label + '</b><span class="muted tiny">' + hint + '</span></div>';
+  $('#pre-body').innerHTML = '<div class="card">' +
+    (!p ? '<p class="muted" style="margin:0 0 14px">Not run yet.</p>'
+      : p.error ? '<div class="banner bad" style="margin:0 0 14px"><b>Preflight could not complete.</b><br>' + esc(p.error) +
+        '<br><span class="muted tiny">Most often this means the Claude CLI is not on PATH. Check the command in Settings below.</span></div>'
+      : line(p.skill, 'zoho-lead-profiler skill', 'the rules this bot runs on') +
+        line(p.zoho, 'Zoho CRM connector', 'where leads come from and go back to') +
+        line(p.zohoLeadsReachable, 'Leads module answers', 'a live read actually succeeded') +
+        line(p.zoominfo, 'ZoomInfo connector', 'first pass on the contact') +
+        line(p.websearch, 'Web search', 'verification and public records') +
+        (p.notes ? '<p class="muted tiny" style="margin:12px 0 0">' + esc(p.notes) + '</p>' : '')) +
+    '<div class="row" style="margin-top:14px"><button class="btn primary" id="pre-run">Run preflight</button>' +
+    '<span class="muted tiny" id="pre-note"></span></div></div>';
+  $('#pre-run').onclick = async () => {
+    $('#pre-run').disabled = true; $('#pre-note').textContent = 'Starting a session…';
+    S.preflight = (await api('/api/preflight', {})).preflight;
+    renderSetup(); renderNav();
+  };
+  $('#c-conc').value = S.config.concurrency;
+  $('#c-max').value = S.config.maxSessions || 6;
+  $('#c-cmd').value = S.config.claudeCmd;
+  $('#c-model').value = S.config.model || '';
+  $('#c-timeout').value = S.config.perLeadTimeoutMin;
+}
+$('#c-save').onclick = async () => {
+  const r = await api('/api/config', {
+    concurrency: Number($('#c-conc').value), maxSessions: Number($('#c-max').value), claudeCmd: $('#c-cmd').value,
+    model: $('#c-model').value, perLeadTimeoutMin: Number($('#c-timeout').value),
+    pepm: Number($('#pepm').value) || S.config.pepm,
+  });
+  S.config = r.config; $('#c-note').textContent = 'Saved.';
+  setTimeout(() => { $('#c-note').textContent = ''; }, 2000);
+};
+
+/* ---------------------------------------------------------- live stream */
+const es = new EventSource('/api/events');
+es.onopen = () => setDot('live', 'Connected.');
+es.onerror = () => setDot('', 'Reconnecting to the server…');
+es.onmessage = (e) => {
+  const m = JSON.parse(e.data);
+  if (m.type === 'run:start') { S.run = m.run; picked.clear(); renderPicker(); renderLive(); renderNav(); }
+  else if (m.type === 'job') {
+    const i = S.run ? S.run.jobs.findIndex((j) => j.leadId === m.job.leadId) : -1;
+    if (i > -1) S.run.jobs[i] = m.job;
+    renderLive(); renderReview(); renderNav();
+  }
+  else if (m.type === 'progress') {
+    const j = S.run && S.run.jobs.find((x) => x.leadId === m.leadId);
+    if (j) { j.progress = j.progress || []; j.progress.push({ kind: m.kind, msg: m.msg }); if (j.progress.length > 40) j.progress.shift(); renderLive(); }
+  }
+  else if (m.type === 'run:done') { S.run = m.run; load(); }
+  else if (m.type === 'status') $('#foot').textContent = String(m.msg).slice(0, 90);
+  else if (m.type === 'leads') { S.leads = m.leads; renderPicker(); }
+  else if (m.type === 'preflight') { S.preflight = m.preflight; if (isAdmin()) renderSetup(); renderNav(); }
+};
+
+window.go = go;
+load().then(initZoho);
+</script>
+</body>
+</html>
