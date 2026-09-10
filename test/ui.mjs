@@ -62,8 +62,27 @@ await r.click('nav button[data-v="review"]'); await r.waitForSelector('#review-b
 await r.click('#review-body .toggle'); await wait(200);
 await r.screenshot({ path: path.join(ROOT, 'test', 'shot-rep-review.png'), fullPage: true });
 await r.click('#approve-all'); await r.click('#write'); await r.waitForSelector('#review-body .pill.ok:text-is("✓")', { timeout: 15000 });
+// basic profile: second button, basic review table, basic detail, write
+await r.click('nav button[data-v="run"]'); await r.waitForSelector('#picker tbody tr', { timeout: 15000 });
+await r.click('#picker tbody tr input');
+if (!(await r.textContent('#start-basic')).includes('Basic profile 1 lead')) throw new Error('basic button label wrong: ' + await r.textContent('#start-basic'));
+await r.click('#start-basic');
+await r.waitForSelector('#live .pill.cool:text-is("basic")', { timeout: 20000 });
+await r.waitForSelector('#live .pill.ok:text-is("done")', { timeout: 20000 });
+await r.click('nav button[data-v="review"]'); await r.waitForSelector('#review-body tbody tr');
+const hdr = await r.textContent('#review-body thead');
+if (!hdr.includes('HR / applicant system') || !hdr.includes('Owner contact')) throw new Error('basic review table not shown: ' + hdr);
+if (!(await r.textContent('#review-body tbody')).includes('Paylocity')) throw new Error('basic row missing HCM');
+await r.click('#review-body .toggle'); await wait(200);
+// the same stub lead was opened during the full run, so the first click may have closed it
+if (!(await r.locator('#review-body .detail').count())) { await r.click('#review-body .toggle'); await wait(200); }
+if (!(await r.textContent('#review-body .detail')).includes('Where the owners sit')) throw new Error('basic detail missing');
+await r.screenshot({ path: path.join(ROOT, 'test', 'shot-rep-review-basic.png'), fullPage: true });
+await r.click('#approve-all'); await r.click('#write'); await r.waitForSelector('#review-body .pill.ok:text-is("✓")', { timeout: 15000 });
+console.log('  basic run reviewed and written');
 await r.click('nav button[data-v="stats"]'); await wait(300);
 console.log('  rep stats tile:', (await r.textContent('#stats-body .tile .n')));
+if (!(await r.textContent('#stats-body')).includes('basic profiles')) throw new Error('stats missing basic tile');
 await r.click('#pw').catch(() => {});
 
 // admin sees rep's run in Everyone stats

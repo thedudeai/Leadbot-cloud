@@ -322,11 +322,13 @@
   <h2>Settings</h2>
   <div class="card">
     <div class="segs">
-      <div class="field"><label for="c-conc">Leads at once, per person</label><input id="c-conc" type="number" min="1" max="8" /></div>
+      <div class="field"><label for="c-conc">Full profiles at once, per person</label><input id="c-conc" type="number" min="1" max="8" /></div>
+      <div class="field"><label for="c-bconc">Basic profiles at once, per person</label><input id="c-bconc" type="number" min="1" max="40" /></div>
       <div class="field"><label for="c-max">Claude sessions at once, whole company</label><input id="c-max" type="number" min="1" max="24" /></div>
       <div class="field"><label for="c-cmd">Claude command</label><input id="c-cmd" /></div>
       <div class="field"><label for="c-model">Model (blank = CLI default)</label><input id="c-model" placeholder="e.g. opus" /></div>
-      <div class="field"><label for="c-timeout">Per-lead timeout (min)</label><input id="c-timeout" type="number" min="5" max="90" /></div>
+      <div class="field"><label for="c-timeout">Full profile timeout (min)</label><input id="c-timeout" type="number" min="5" max="90" /></div>
+      <div class="field"><label for="c-btimeout">Basic profile timeout (min)</label><input id="c-btimeout" type="number" min="3" max="30" /></div>
     </div>
     <div class="row" style="margin-top:14px">
       <button class="btn primary" id="c-save">Save settings</button>
@@ -594,7 +596,7 @@ function renderPicker() {
       '<td class="muted tiny">' + esc(l.industry || '—') + '</td>' +
       '<td class="num tiny">' + (l.employees == null ? '—' : l.employees) + '</td>' +
       '<td class="muted tiny">' + esc(String(l.created || '').slice(0, 10) || '—') + '</td>' +
-      '<td class="muted tiny">' + (l.profiledDate ? esc(String(l.profiledDate).slice(0, 10)) : 'never') + '</td></tr>').join('');
+      '<td class="muted tiny">' + (l.profiledDate ? esc(String(l.profiledDate).slice(0, 10)) + (l.profileType ? ' <span class="pill ' + (l.profileType === 'Basic' ? 'cool' : 'ok') + '">' + esc(l.profileType.toLowerCase()) + '</span>' : '') : 'never') + '</td></tr>').join('');
 
   host.innerHTML =
     '<div class="card" style="padding:0">' +
@@ -624,14 +626,18 @@ function renderPicker() {
         '</div>' : '') +
     '</div>' +
     '<div class="bar-sticky"><button class="btn primary" id="start" disabled>Profile 0 leads</button>' +
+    '<button class="btn" id="start-basic" disabled title="Six facts per lead, one lookup each: what they are, ownership and CEO, headcount, HR/applicant system, HQ, owner contact info. About a tenth of the cost of a full profile.">Basic profile 0 leads</button>' +
     '<span class="muted tiny" id="est"></span></div>';
 
   const sync = () => {
     const c = picked.size;
-    const b = $('#start');
+    const b = $('#start'), bb = $('#start-basic');
     b.disabled = !c; b.textContent = 'Profile ' + c + ' lead' + (c === 1 ? '' : 's');
-    const conc = S.config.concurrency || 3;
-    $('#est').textContent = c ? '~' + Math.ceil(c / conc) * 8 + '–' + Math.ceil(c / conc) * 15 + ' min at ' + conc + ' at a time' : '';
+    bb.disabled = !c; bb.textContent = 'Basic profile ' + c + ' lead' + (c === 1 ? '' : 's');
+    const conc = S.config.concurrency || 3, bconc = S.config.basicConcurrency || 20;
+    $('#est').textContent = c
+      ? 'Full: ~' + Math.ceil(c / conc) * 8 + '–' + Math.ceil(c / conc) * 15 + ' min at ' + conc + ' at a time \u00b7 Basic: ~' + Math.ceil(c / bconc) * 2 + '–' + Math.ceil(c / bconc) * 5 + ' min at ' + bconc + ' at a time'
+      : '';
     // The header box only ever speaks for the rows currently on screen.
     $('#all').checked = S.leads.length > 0 && S.leads.every((l) => picked.has(l.id));
     $('#nb-run').textContent = c ? c + ' picked' : (S.leads.length || '—');
@@ -665,11 +671,13 @@ function renderPicker() {
   if ($('#prev')) $('#prev').onclick = () => { if (browse.page > 1) { browse.page--; browseFetch(); } };
   if ($('#next')) $('#next').onclick = () => { if (pageInfo.hasMore) { browse.page++; browseFetch(); } };
   if ($('#per')) $('#per').onchange = () => { browse.per = Number($('#per').value) || 50; browse.page = 1; browseFetch(); };
-  $('#start').onclick = async () => {
-    $('#start').disabled = true;
-    const r = await api('/api/run', { leads: Array.from(picked.values()), pepm: Number($('#pepm').value) || S.config.pepm });
-    if (r.error) { $('#run-banner').innerHTML = '<div class="banner bad">' + esc(r.error) + '</div>'; $('#start').disabled = false; }
+  const kick = async (mode) => {
+    $('#start').disabled = true; $('#start-basic').disabled = true;
+    const r = await api('/api/run', { leads: Array.from(picked.values()), pepm: Number($('#pepm').value) || S.config.pepm, mode });
+    if (r.error) { $('#run-banner').innerHTML = '<div class="banner bad">' + esc(r.error) + '</div>'; $('#start').disabled = false; $('#start-basic').disabled = false; }
   };
+  $('#start').onclick = () => kick('full');
+  $('#start-basic').onclick = () => kick('basic');
   sync();
 }
 
@@ -683,7 +691,7 @@ function renderLive() {
   setDot(running ? 'busy' : 'live', running ? 'Working — ' + done + '/' + jobs.length + ' done' : 'Idle.');
 
   host.innerHTML =
-    '<h2>Run ' + esc(S.run.id) + ' — ' + done + '/' + jobs.length + ' finished</h2>' +
+    '<h2>Run ' + esc(S.run.id) + ' ' + modePill(S.run) + ' — ' + done + '/' + jobs.length + ' finished</h2>' +
     (S.run.restored ? '<p class="muted tiny" style="margin:-6px 0 12px">Restored from ' + new Date(S.run.startedAt).toLocaleString() + ' — your last run, brought back after the server restarted. Anything not yet written is still waiting in Review.</p>' : '') +
     jobs.map(renderJob).join('') +
     (S.run.finishedAt ? '<div class="bar-sticky"><button class="btn primary" onclick="go(\'review\')">Review ' + done + ' result' + (done === 1 ? '' : 's') + '</button></div>' : '');
@@ -713,19 +721,26 @@ function renderReview() {
 
   // A lead with no company description needs a human before it is written — that
   // field is required and a recent run shipped without it.
+  const basic = isBasic(S.run);
   const noDesc = (j) => !(j.result.fields && String(j.result.fields.Description || '').trim());
   const flagged = jobs.filter((j) => j.result.needsHuman || j.result.contactChanged || noDesc(j));
   host.innerHTML =
+    '<p class="muted tiny" style="margin:-6px 0 12px">' + modePill(S.run) + ' ' + (basic
+      ? 'Six facts per lead, one lookup each. Writing stamps the record <b>Profile Type: Basic</b> so you can tell it apart from a full profile later.'
+      : 'Full research profile. Writing stamps the record <b>Profile Type: Comprehensive</b>.') + '</p>' +
     (flagged.length ? '<div class="banner warn"><b>' + flagged.length + ' need' + (flagged.length === 1 ? 's' : '') +
       ' your eyes before writing.</b><br>' + flagged.map((j) =>
         esc(j.company) + ' — ' + esc(j.result.needsHuman
           || (!(j.result.fields && String(j.result.fields.Description || '').trim()) ? 'no company description was written' : '')
           || 'the contact on the record was replaced')).join('<br>') + '</div>' : '') +
     '<div class="card" style="padding:0"><table><thead><tr>' +
-      '<th style="width:34px"></th><th>Company</th><th>Decision-maker</th>' +
-      '<th class="num">Emp</th><th>Phone</th><th>Likely provider</th>' +
-      '<th class="num">2nd contact</th><th></th></tr></thead><tbody>' +
-    jobs.map(reviewRow).join('') + '</tbody></table></div>' +
+      (basic
+        ? '<th style="width:34px"></th><th>Company</th><th>What they are</th><th>Owner / CEO</th>' +
+          '<th class="num">Emp</th><th>HR / applicant system</th><th>HQ</th><th>Owner contact</th><th></th>'
+        : '<th style="width:34px"></th><th>Company</th><th>Decision-maker</th>' +
+          '<th class="num">Emp</th><th>Phone</th><th>Likely provider</th>' +
+          '<th class="num">2nd contact</th><th></th>') + '</tr></thead><tbody>' +
+    jobs.map(basic ? basicRow : reviewRow).join('') + '</tbody></table></div>' +
     '<div class="bar-sticky"><button class="btn primary" id="write" disabled>Write 0 to Zoho</button>' +
     '<button class="btn ghost sm" id="approve-all">Approve all clean</button>' +
     '<span class="muted tiny" id="write-note"></span></div>' +
@@ -771,6 +786,66 @@ function syncWrite() {
   const b = $('#write'); if (!b) return;
   b.disabled = !approved.size;
   b.textContent = 'Write ' + approved.size + ' to Zoho';
+}
+
+const isBasic = (run) => !!(run && run.mode === 'basic');
+const modePill = (run) => isBasic(run) ? '<span class="pill cool">basic</span>' : '<span class="pill ok">comprehensive</span>';
+
+function basicRow(j) {
+  const r = j.result, b = r.basic || {}, c = r.contact || {};
+  const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || b.ceo || '—';
+  const isOpen = open.has(j.leadId);
+  const emp = r.employees == null ? (b.employees == null ? '—' : b.employees) : r.employees;
+  const split = (b.officeStaff != null || b.fieldStaff != null)
+    ? '<br><span class="muted">' + (b.officeStaff != null ? b.officeStaff + ' office' : '') + (b.officeStaff != null && b.fieldStaff != null ? ' · ' : '') + (b.fieldStaff != null ? b.fieldStaff + ' field' : '') + '</span>' : '';
+  const fac = b.facilities ? '<br><span class="pill cool">' + esc(String(b.facilities)) + ' facilities</span>' : '';
+  const reach = [c.directPhone || c.mobilePhone, c.email].filter(Boolean).map(esc).join('<br>');
+  return '<tr>' +
+    '<td>' + (j.written ? '<span class="pill ok">✓</span>'
+      : '<input type="checkbox" data-id="' + esc(j.leadId) + '" ' + (approved.has(j.leadId) ? 'checked' : '') + '/>') + '</td>' +
+    '<td><b>' + esc(j.company) + '</b>' +
+      (!(r.fields && String(r.fields.Description || '').trim()) ? '<br><span class="pill bad">no description</span>' : '') +
+      ((b.gaps || []).length ? '<br><span class="muted tiny">missing: ' + esc(b.gaps.join(', ')) + '</span>' : '') + '</td>' +
+    '<td class="tiny" style="max-width:220px">' + esc(b.companyType || '') + '</td>' +
+    '<td class="tiny">' + esc(name) + (c.title ? '<br><span class="muted">' + esc(c.title) + '</span>' : '') +
+      (b.ownership ? '<br><span class="muted">' + esc(b.ownership) + '</span>' : '') +
+      (r.contactChanged ? '<br><span class="pill flag">replaced</span>' : '') + '</td>' +
+    '<td class="num tiny">' + emp + (b.employeesBasis && b.employeesBasis !== 'stated' ? '<span class="muted">e</span>' : '') + split + fac + '</td>' +
+    '<td class="tiny">' + esc(b.hcm || '') + '</td>' +
+    '<td class="tiny">' + esc(b.hq || '') + (b.execLocation && b.execLocation !== b.hq ? '<br><span class="muted">owners: ' + esc(b.execLocation) + '</span>' : '') + '</td>' +
+    '<td class="tiny">' + (reach || '<span class="pill flag">none</span>') + '</td>' +
+    '<td><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen ? 'hide' : 'open') + '</button></td></tr>' +
+    (isOpen ? '<tr><td colspan="9" style="padding:0"><div class="detail">' + basicDetail(j) + '</div></td></tr>' : '');
+}
+
+function basicDetail(j) {
+  const r = j.result, b = r.basic || {}, c = r.contact || {}, w = j.writeResult;
+  const notes = Object.entries(r.notes || {}).filter((e) => e[1] && String(e[1]).trim());
+  const row = (k, v) => v ? '<dt>' + k + '</dt><dd>' + v + '</dd>' : '';
+  return '<dl class="kv">' +
+    row('What they are', esc(b.companyType || '')) +
+    row('Ownership', esc(b.ownership || '')) +
+    row('CEO / top person', esc(b.ceo || '')) +
+    row('Employees', r.employees == null && b.employees == null ? '' : esc(String(r.employees ?? b.employees)) +
+      (b.employeesBasis ? ' <span class="muted tiny">(' + esc(b.employeesBasis) + ')</span>' : '') +
+      (b.officeStaff != null || b.fieldStaff != null ? ' — ' + (b.officeStaff != null ? b.officeStaff + ' in the office' : '') + (b.officeStaff != null && b.fieldStaff != null ? ', ' : '') + (b.fieldStaff != null ? b.fieldStaff + ' in the field' : '') : '')) +
+    row('Facilities', b.facilities ? esc(String(b.facilities)) : '') +
+    row('HR / applicant system', b.hcm ? esc(b.hcm) + (b.hcmEvidence ? ' <span class="muted tiny">' + esc(b.hcmEvidence) + '</span>' : '') : '') +
+    row('Headquarters', esc(b.hq || '')) +
+    row('Where the owners sit', esc(b.execLocation || '')) +
+    row('Owner contact', [c.firstName, c.lastName].filter(Boolean).join(' ') ? esc([c.firstName, c.lastName].filter(Boolean).join(' ')) + (c.title ? ' — ' + esc(c.title) : '') +
+      (c.email ? '<br>' + esc(c.email) : '') + (c.directPhone ? '<br>direct ' + esc(c.directPhone) : '') + (c.mobilePhone ? '<br>mobile ' + esc(c.mobilePhone) : '') : '') +
+    row('Other C-suite', (r.additionalContacts || []).map((a) =>
+      esc([a.firstName, a.lastName].filter(Boolean).join(' ')) + (a.title ? ' <span class="muted">' + esc(a.title) + '</span>' : '') +
+      (a.directPhone ? ' · ' + esc(a.directPhone) : '') + (a.email ? ' · ' + esc(a.email) : '') +
+      (a.reason ? ' <span class="pill cool">' + esc(a.reason) + '</span>' : '')).join('<br>')) +
+    row('Company description', (r.fields && r.fields.Description) ? esc(r.fields.Description) : '<span style="color:var(--bad)">Missing — this field is required on every lead.</span>') +
+    ((b.gaps || []).length ? row('Not found', '<span class="muted">' + esc(b.gaps.join(', ')) + ' — one lookup each, no second attempt in basic mode.</span>') : '') +
+    (r.needsHuman ? '<dt style="color:var(--warn)">Needs a human</dt><dd>' + esc(r.needsHuman) + '</dd>' : '') +
+    (w ? '<dt>Write result</dt><dd>' + writeResultHtml(w) + '</dd>' : '') +
+    '</dl>' +
+    '<div style="font-size:11px;letter-spacing:.06em;color:var(--dim2);margin-bottom:8px">NOTE THAT WOULD BE WRITTEN</div>' +
+    (notes.map((e) => '<div class="note"><b>' + esc(e[0]) + '</b><pre>' + esc(e[1]) + '</pre></div>').join('') || '<div class="muted tiny">No note.</div>');
 }
 
 function reviewRow(j) {
@@ -905,6 +980,8 @@ function renderStats() {
       tile(s.contactChanged, 'contacts replaced', "The record's person had left or was the wrong seat") +
       tile(s.secondContactAdded, 'second contact added', 'Mostly where the owner had no reachable number') +
       tile('$' + s.avgCost.toFixed(2), 'avg cost per lead', money(s.totalCost) + ' total \u00b7 ' + s.avgMinutes.toFixed(0) + ' min each') +
+      (s.byMode && s.byMode.basic && s.byMode.basic.leads
+        ? tile(s.byMode.basic.leads, 'basic profiles', '$' + s.byMode.basic.avgCost.toFixed(2) + ' each vs $' + ((s.byMode.full || {}).avgCost || 0).toFixed(2) + ' for a full profile \u00b7 ' + s.byMode.basic.written + ' written') : '') +
       tile(s.disqualified, 'disqualified', 'Dissolved, already a client, or under a PEO') +
     '</div>' +
     peopleHtml +
@@ -922,8 +999,8 @@ function renderStats() {
     '</div></div>' +
 
     '<h2>Recent runs</h2><div class="card" style="padding:0"><table>' +
-    '<thead><tr><th>Run</th><th>Who</th><th>When</th><th class="num">Leads</th><th class="num">Done</th><th class="num">Written</th></tr></thead><tbody>' +
-    s.recentRuns.map((r) => '<tr><td class="tiny">' + esc(r.id) + '</td><td class="tiny">' + esc(r.userName || '—') + '</td>' +
+    '<thead><tr><th>Run</th><th>Type</th><th>Who</th><th>When</th><th class="num">Leads</th><th class="num">Done</th><th class="num">Written</th></tr></thead><tbody>' +
+    s.recentRuns.map((r) => '<tr><td class="tiny">' + esc(r.id) + '</td><td class="tiny">' + modePill(r) + '</td><td class="tiny">' + esc(r.userName || '—') + '</td>' +
       '<td class="muted tiny">' + new Date(r.at).toLocaleString() + '</td>' +
       '<td class="num tiny">' + r.n + '</td><td class="num tiny">' + r.done + '</td>' +
       '<td class="num tiny">' + r.written + '</td></tr>').join('') +
@@ -1198,6 +1275,8 @@ function renderSetup() {
     renderSetup(); renderNav();
   };
   $('#c-conc').value = S.config.concurrency;
+  $('#c-bconc').value = S.config.basicConcurrency || 20;
+  $('#c-btimeout').value = S.config.basicTimeoutMin || 12;
   $('#c-max').value = S.config.maxSessions || 6;
   $('#c-cmd').value = S.config.claudeCmd;
   $('#c-model').value = S.config.model || '';
@@ -1205,7 +1284,8 @@ function renderSetup() {
 }
 $('#c-save').onclick = async () => {
   const r = await api('/api/config', {
-    concurrency: Number($('#c-conc').value), maxSessions: Number($('#c-max').value), claudeCmd: $('#c-cmd').value,
+    concurrency: Number($('#c-conc').value), basicConcurrency: Number($('#c-bconc').value), basicTimeoutMin: Number($('#c-btimeout').value),
+    maxSessions: Number($('#c-max').value), claudeCmd: $('#c-cmd').value,
     model: $('#c-model').value, perLeadTimeoutMin: Number($('#c-timeout').value),
     pepm: Number($('#pepm').value) || S.config.pepm,
   });

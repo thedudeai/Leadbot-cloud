@@ -71,18 +71,32 @@ r = await call('rep', '/api/write', { leadIds: ['5001'] }); assert.equal(r.json.
 s = await pollRun('rep', (x) => x.run.jobs.find((j) => j.leadId === '5001').written);
 assert.equal(s.run.jobs.find((j) => j.leadId === '5002').written, false); ok('only the approved lead was written');
 
+// 5b. Basic run — wide fan-out, own mode label, own review shape
+r = await call('rep', '/api/run', { mode: 'basic', leads: Array.from({ length: 25 }, (_, i) => ({ id: String(6000 + i), company: 'Basic Co ' + i, owner: { id: '999' } })) });
+assert.equal(r.status, 200); const basicRunId = r.json.runId; ok('rep starts a 25-lead basic run ' + basicRunId);
+s = await pollRun('rep', (x) => x.run && x.run.id === basicRunId && x.run.finishedAt && x.run.jobs.every((j) => j.status === 'done'), 120);
+assert.equal(s.run.mode, 'basic'); assert.equal(s.run.jobs.length, 25); ok('basic run carries mode=basic and finished all 25');
+assert.equal(s.run.jobs[0].result.basic.hcm, 'Paylocity'); assert.equal(s.run.jobs[0].cost, 0.05); ok('basic result shape and cost captured');
+assert.equal(JSON.parse(fs.readFileSync(path.join(STORE, 'data', 'history.json'))).runs.find((x) => x.id === basicRunId).mode, 'basic'); ok('mode persisted to history');
+r = await call('rep', '/api/write', { leadIds: ['6000', '6001'] }); assert.equal(r.json.queued, 2); ok('basic results queue for write');
+s = await pollRun('rep', (x) => x.run.jobs.filter((j) => j.written).length === 2);
+ok('basic writes complete through the CLI fallback');
+r = await call('rep', '/api/run', { leads: Array.from({ length: 51 }, (_, i) => ({ id: String(7000 + i), company: 'X', owner: { id: '999' } })) });
+assert.equal(r.status, 400); assert.match(r.json.error, /Basic profile/); ok('51-lead full run refused and pointed at basic');
+
 // 6. Stats
 r = await call('rep', '/api/stats?scope=all'); assert.equal(r.status, 403); ok('rep cannot see everyone stats');
-r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 2); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 1); ok('admin sees company stats by person');
+r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 27); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
+assert.equal(r.json.byMode.basic.leads, 25); assert.equal(r.json.byMode.full.leads, 2); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
 r = await call('admin', '/api/stats'); assert.equal(r.json.totalLeads, 0); ok("admin's own stats are separate");
 
 // 7. Restart → restore
 child.kill(); await wait(500); child = boot(); await up();
 r = await call('rep', '/api/state'); assert.equal(r.status, 200); ok('session cookie survives a restart');
-assert.equal(r.json.run.id, runId); assert.equal(r.json.run.restored, true);
-assert.equal(r.json.run.jobs.find((j) => j.leadId === '5002').result.contact.firstName, 'Pat');
-assert.equal(r.json.run.jobs.find((j) => j.leadId === '5001').written, true); ok('run restored from disk with results and written flags');
-r = await call('rep', '/api/write', { leadIds: ['5002'] }); assert.equal(r.json.queued, 1); ok('unwritten lead from the restored run can still be written');
+assert.equal(r.json.run.id, basicRunId); assert.equal(r.json.run.restored, true); assert.equal(r.json.run.mode, 'basic');
+assert.equal(r.json.run.jobs.find((j) => j.leadId === '6002').result.basic.ceo, 'Sam Roth');
+assert.equal(r.json.run.jobs.find((j) => j.leadId === '6000').written, true); ok('latest (basic) run restored from disk with mode, results and written flags');
+r = await call('rep', '/api/write', { leadIds: ['6002'] }); assert.equal(r.json.queued, 1); ok('unwritten lead from the restored run can still be written');
 
 // 8. Disable / logout
 r = await call('admin', '/api/users/' + rep.id, { enabled: false }); r = await call('rep', '/api/state'); assert.equal(r.status, 401); ok('disabling a user kills their session');

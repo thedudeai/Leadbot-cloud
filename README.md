@@ -18,6 +18,23 @@ a login in front of it so the whole payroll team can use one deployment.
 | Zoho credentials | `data/zoho.json` on the desktop | `ZOHO_*` environment variables (an admin can still override them in Setup) |
 | Storage | the app folder | a persistent volume at `DATA_DIR` (`/data` on Railway) |
 
+## Two profile types
+
+| | Comprehensive (**Profile**) | Basic (**Basic profile**) |
+|---|---|---|
+| What it does | the full skill: verification ladder, four research rounds, entity roll-up, payroll findings, icebreakers | six facts, one lookup method each, hard ceiling of 12 tool calls |
+| The six facts | — | what they are · ownership and CEO · headcount (office vs field for home care, group-wide plus facility count for nursing groups) · HCM/HRIS/ATS from the apply links on their job postings · HQ and where the owners sit · owner and C-suite direct phone and email |
+| Leads at once | `concurrency` (default 3) under the company-wide `maxSessions` cap | `basicConcurrency` (default 20), outside the company-wide cap |
+| Per run | up to 50 | up to 300 |
+| Timeout | `perLeadTimeoutMin` (25) | `basicTimeoutMin` (12) |
+| Zoho label | `Profile_Type = Comprehensive` | `Profile_Type = Basic` |
+
+Both buttons sit under the lead table and take the same selection. A basic run writes the contact,
+the additional contacts, the HQ address, headcount, location count, HCM, the one-sentence
+Description and a single **BASIC PROFILE** note. `Profile_Type` is a picklist on Leads (created
+10 Sep 2026); the picker shows it next to "Last profiled" so a rep can see which leads have only
+had the light pass.
+
 The profile prompt, the skill files, the review gate, the scrub/date/picklist enforcement in the
 write path and the Zoho REST calls are unchanged. `runClaude` still spawns
 `claude -p --output-format stream-json --permission-mode bypassPermissions`.

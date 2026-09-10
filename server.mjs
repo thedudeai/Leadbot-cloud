@@ -39,8 +39,10 @@ const writeJSON = (p, v) => fs.writeFileSync(p, JSON.stringify(v, null, 2));
 
 const DEFAULT_CONFIG = {
   pepm: 20,
-  concurrency: 3,               // per run — how many of one person's leads go at once
-  maxSessions: 6,               // server-wide — total Claude sessions alive at any moment
+  concurrency: 3,               // per comprehensive run — how many of one person's leads go at once
+  basicConcurrency: 20,         // per basic run — the light pass is cheap, so it fans out wide
+  maxSessions: 6,               // server-wide — total comprehensive sessions alive at any moment
+  basicTimeoutMin: 12,          // a basic session that runs longer than this is doing too much
   claudeCmd: 'claude',
   model: '',                    // '' = whatever the CLI defaults to
   permissionMode: 'bypassPermissions',
@@ -273,7 +275,7 @@ function foldCriteria(list) {
 const LEAD_COLUMNS = [
   'id', 'Company', 'First_Name', 'Last_Name', 'Designation', 'Email', 'Phone', 'Mobile',
   'City', 'State', 'Industry', 'Employee_Count', 'Website',
-  'Lead_Status', 'Owner', 'Created_Time', 'Modified_Time', 'Profiled_Date',
+  'Lead_Status', 'Owner', 'Created_Time', 'Modified_Time', 'Profiled_Date', 'Profile_Type',
 ];
 
 const SORT_FIELDS = {
@@ -347,6 +349,7 @@ function mapLeadRow(row) {
     created: row.Created_Time || '',
     modified: row.Modified_Time || '',
     profiledDate: row.Profiled_Date || null,
+    profileType: row.Profile_Type || null,
     owner: owner ? { id: String(owner.id), name: owner.name || owner.full_name || '' } : null,
     status: row.Lead_Status || '',
   };
@@ -804,6 +807,7 @@ const PICKLISTS = {
   Payroll_Frequency: ['Bi-weekly', 'Monthly', 'Semi-Monthly', 'Weekly', 'Quarterly'],
   Benefits_Carrier: ['Aetna', 'Anthem', 'BCBS', 'Cigna', 'United'],
   Existing_Client: ['Yes', 'No'],
+  Profile_Type: ['Basic', 'Comprehensive'],
   Salutation: ['Mr.', 'Mrs.', 'Ms.', 'Dr.', 'Prof.', 'Mr', 'Ms', 'Dr'],
 };
 
@@ -916,7 +920,8 @@ async function writeNote(leadId, title, content) {
  * pieces that did succeed still listed, because "failed" on a half-written record
  * sends the user looking for changes that are actually there.
  */
-async function writeLeadDirect(result) {
+async function writeLeadDirect(result, mode = 'full') {
+  const basic = mode === 'basic';
   const leadId = String(result.leadId || '');
   const out = { ok: false, partial: false, leadId, fieldsWritten: [], notesWritten: [], newLeadId: null, skipped: [], warnings: [], error: null };
   if (!leadId) { out.error = 'This result has no Zoho record id.'; return out; }
@@ -1007,6 +1012,10 @@ async function writeLeadDirect(result) {
   // segment is a query against it — so it stays. Nothing else from that batch does.
   if (has('Profiled_Date')) payload.Profiled_Date = todayISO();
   else out.skipped.push('Profiled_Date — not on this org\'s Leads layout, so the "never profiled" segment will not exclude this lead.');
+  // Two kinds of profile now write to the same record, and a rep needs to know
+  // which one they are looking at: a Basic pass is six facts, not a research file.
+  if (has('Profile_Type')) put(payload, 'Profile_Type', basic ? 'Basic' : 'Comprehensive');
+  else out.skipped.push('Profile_Type — not on this org\'s Leads layout, so this record is not labelled Basic or Comprehensive.');
 
   const failures = [];
 
@@ -1073,7 +1082,7 @@ async function writeLeadDirect(result) {
     else failures.push(`Note ${title} failed: ${o.error}`);
   }
 
-  if (!Object.keys(notes).some((k) => k.toUpperCase().includes('FINDING'))) {
+  if (!basic && !Object.keys(notes).some((k) => k.toUpperCase().includes('FINDING'))) {
     out.warnings.push('No PAYROLL FINDINGS note. That is the most important note on the record — everything about how these people get paid should be in it.');
   }
 
@@ -1443,11 +1452,13 @@ Field rules:
 - "needsHuman" is null unless something genuinely needs a person: an ambiguous name match, an unproven company identity, or a value you would be overriding without solid evidence.`;
 }
 
-function writePrompt(result, pepm) {
+function writePrompt(result, pepm, mode = 'full') {
   return `${SKILL_LINE}
 
 ${SKILL_FILES_BLOCK}
-
+${mode === 'basic' ? `
+THIS IS A BASIC PROFILE, not a full research profile: six facts and one "BASIC PROFILE" note. Write the fields it carries, the contact, the additional contacts and that one note, and set Profile_Type to "Basic". Do not expect or invent a PAYROLL FINDINGS note or icebreakers; the rules below about those notes do not apply here.
+` : ''}
 A human has reviewed and approved this profile. Execute Step 6 of the skill — the write-back — for this one lead, exactly per references/zoho-writeback.md. Do NOT re-research anything and do NOT ask any questions; the approval already happened.
 
 PEPM in use: $${pepm}.
@@ -1479,6 +1490,100 @@ Output ONLY a fenced json block:
 Each entry in "overrides" is {"field": "", "was": "", "now": ""}.`;
 }
 
+// The BASIC profile. Six facts, one lookup method each, no skill files, no
+// escalation ladders. It exists because the comprehensive pass is the right tool
+// for a lead a rep is about to call and the wrong tool for sizing up two hundred
+// leads at once. The whole point is the cost ceiling, so the prompt is
+// self-contained: nothing is read from disk and the tool budget is a hard stop.
+function basicPrompt(lead) {
+  return `You are doing a BASIC PROFILE of one company for a payroll sales team. This is a light pass, not research. Six facts, one lookup method each, then stop.
+
+Company — this is the Zoho lead record, current as of this run. Do NOT re-read it from Zoho:
+- Zoho record id: ${lead.id}
+- Company: ${lead.company}
+- On record: ${lead.contact || '(none)'} ${lead.title ? `— ${lead.title}` : ''}
+- Location: ${[lead.city, lead.state].filter(Boolean).join(', ') || '(unknown)'}
+- Industry on record: ${lead.industry || '(unknown)'}
+- Website: ${lead.website || '(none on record)'}
+- Email on record: ${lead.email || '(none)'} · Phone on record: ${lead.phone || '(none)'} · Mobile: ${lead.mobile || '(none)'}
+- Employee count on record (ZoomInfo import, unverified): ${lead.employees ?? '(none)'}
+
+THE SIX FACTS AND THE ONE WAY TO GET EACH:
+1. WHAT THEY ARE — nursing home, home care agency, manufacturer, charter school, etc. Method: the company website home page (WebFetch). No website on record: ONE WebSearch for "${lead.company}" ${lead.state || ''} and use the first result that is clearly them.
+2. OWNERSHIP AND CEO — who owns it (a single owner, partners, a family, a private-equity group, a public company, a nonprofit board) and who the CEO or top person is. Method: ONE ZoomInfo contact search on the company for owners and C-level people (mcp__claude_ai_ZoomInfo__search_contacts_v2 with management level owner/C-level, up to 10 rows). If the website has an about or leadership page and you already fetched the site, read the names off that too, but do not go looking for more.
+3. EMPLOYEE COUNT — Method: ONE ZoomInfo company enrichment (mcp__claude_ai_ZoomInfo__enrich_companies) for the headline count. Two special cases:
+   - HOME CARE / HOME HEALTH / STAFFING: the ZoomInfo number is usually the office and the real workforce is in the field. Do ONE extra WebSearch: "${lead.company}" caregivers OR aides OR nurses OR employees — and if the company or a news item states a field-staff figure, report office and field separately.
+   - NURSING HOME / ASSISTED LIVING / ANY MULTI-FACILITY GROUP: count the whole group. Do ONE extra WebSearch: "${lead.company}" facilities OR locations OR "skilled nursing" — and report the number of facilities and the group-wide headcount (sum the facilities if a per-facility figure is what you find, and say it is a sum).
+4. HCM / HRIS / ATS — what system their job applications run on. Method: fetch the careers or jobs page (WebFetch the careers link from the home page, or {website}/careers) and read the host of the apply links. myworkdayjobs.com = Workday, greenhouse.io = Greenhouse, lever.co = Lever, icims.com = iCIMS, ultipro.com or ukg.com = UKG, paylocity.com = Paylocity, paycomonline.net = Paycom, paycor.com = Paycor, adp.com or workforcenow = ADP, bamboohr.com = BambooHR, applytojob.com = JazzHR, jobvite.com = Jobvite, smartrecruiters.com = SmartRecruiters, ashbyhq.com = Ashby, workable.com = Workable, isolvedhire or isolved = isolved, apploi.com = Apploi, hireology.com = Hireology, indeed-hosted or a plain email/web form = none. If there is no careers page, ONE WebSearch: site:indeed.com OR site:linkedin.com/jobs "${lead.company}" and read the apply destination of one posting. For a multi-facility group, check a second facility's posting if it is right there in the results; do not tour every facility.
+5. HQ AND WHERE THE OWNERS SIT — the headquarters address (from the same ZoomInfo company enrichment as fact 3) and, if the owners or executives sit somewhere else (common with nursing home groups whose owners are in New York or New Jersey while the facilities are elsewhere), that city and state from the ZoomInfo contact rows in fact 2.
+6. OWNER AND C-SUITE DIRECT CONTACT INFO — direct phone, mobile and email for the owner/CEO and up to two more C-suite or partner-level people. Method: ONE mcp__claude_ai_ZoomInfo__enrich_contacts call for the top three people from fact 2, in one batch. Take what it returns; do not go hunting elsewhere.
+
+WORK EFFICIENTLY — the budget is the point of this mode:
+- Start with ONE ToolSearch: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_companies,mcp__claude_ai_ZoomInfo__search_contacts_v2,mcp__claude_ai_ZoomInfo__enrich_contacts". Never load tools one at a time.
+- Round 1, all in ONE message: the website fetch, the ZoomInfo company enrichment, and the ZoomInfo contact search. Round 2, all in ONE message: the careers page fetch, the contact enrichment, and whichever single extra WebSearch fact 3 or fact 4 calls for. That is normally the whole job.
+- HARD CEILING: TWELVE tool calls including the ToolSearch. If a method comes up empty, record the gap and move on. There is no escalation ladder in this mode and no second method for anything.
+- No commentary between tool calls. No narration. Hold everything for the final JSON.
+- Do NOT write anything to Zoho. A human reviews this first.
+
+When done, output ONLY a fenced json block as your entire final message — no prose before or after:
+
+\`\`\`json
+{
+  "leadId": "${lead.id}",
+  "company": "${lead.company}",
+  "basic": {
+    "companyType": "",
+    "ownership": "",
+    "ceo": "",
+    "employees": null,
+    "employeesBasis": "stated | estimate | sum of facilities",
+    "officeStaff": null,
+    "fieldStaff": null,
+    "facilities": null,
+    "hcm": "",
+    "hcmEvidence": "",
+    "hq": "",
+    "execLocation": "",
+    "gaps": []
+  },
+  "employees": null,
+  "employeesBasis": "estimate",
+  "contactChanged": false,
+  "contact": {
+    "firstName": "", "lastName": "", "title": "",
+    "email": "", "emailVerified": false,
+    "directPhone": "", "directPhoneVerified": false,
+    "mobilePhone": "", "mobilePhoneVerified": false,
+    "linkedin": "",
+    "employmentVerifiedBy": "ZoomInfo, checked ${todayUS()}",
+    "replacesRecordContact": false
+  },
+  "additionalContacts": [
+    { "firstName": "", "lastName": "", "title": "", "functionalRole": "", "email": "", "directPhone": "", "reason": "c-suite" }
+  ],
+  "fields": {
+    "Website": "", "Street": "", "City": "", "State": "", "Zip_Code": "",
+    "Employee_Count": null, "Number_of_Locations": "", "Description": "",
+    "HCM": "", "LinkedIn_Company_Profile_URL": "", "Email_Domain": "",
+    "Entity_Name_Ultimate_Parent": ""
+  },
+  "notes": { "BASIC PROFILE": "" },
+  "needsHuman": null
+}
+\`\`\`
+
+Field rules:
+- "basic" is the six facts in plain words for the dashboard table. "gaps" lists which of the six you could not establish, e.g. ["hcm", "execLocation"]. An empty string or null elsewhere means not found; never write "not found", "N/A" or "unknown" as a value.
+- "contact" is the OWNER or CEO — the top person from fact 2 with whatever fact 6 returned. If the person already on the record IS an owner or C-suite person, keep them in "contact" (update their title, phone and email from ZoomInfo) and set "replacesRecordContact": false. If the record's person is not at that level, the owner/CEO goes in "contact" with "replacesRecordContact": true and "contactChanged": true, and the record's person goes in "additionalContacts" with reason "displaced". The other C-suite people from fact 6 fill the rest of "additionalContacts" (two slots at most are written).
+- "functionalRole" on an additional contact must be one of: CEO, Partner - Owner, President, CFO, Controller, Head of Finance, COO, Head of HR, HR Admin, HR Manager, Office Manager, Marketing, Payroll, Board Member, Sales Person, Unknown. Keep the real title in "title".
+- "employees" (top level and in "fields".Employee_Count) is the TOTAL workforce — office plus field for home care, the whole group for a facility operator. "Number_of_Locations" is the facility count as a string when there is one. "Entity_Name_Ultimate_Parent" is the group or parent company name when the lead is one facility of a group.
+- "fields".Street/City/State/Zip_Code are the HQ from fact 5. Omit any key you have no value for — do not send an empty string to hold a place.
+- "Description" is MANDATORY: ONE plain sentence saying what the company is, from fact 1 — "Sunrise Care Group operates eleven skilled nursing facilities in Pennsylvania and Ohio." Nothing else in it.
+- "HCM" is the platform name from fact 4 (e.g. "Paylocity"). If the ATS is one of ADP, Paycom, Paylocity, Paycor, UKG, isolved, Paychex or Rippling, say so plainly in the note — those are bundled suites, so the recruiting system is almost certainly their payroll provider too.
+- The "BASIC PROFILE" note is the six facts written for a rep, one line each, in this exact shape: a 2-8 word headline in plain capitals, then an em dash, then the detail, then the source in round brackets and the date in square brackets at the very end. Example line: "· OWNED BY TWO PARTNERS — Moshe Klein and David Roth own the group; Klein is the CEO. Both sit in Lakewood, New Jersey, while every facility is in Ohio. (ZoomInfo) [${todayUS()}]". Dates are US numeric with no leading zeros. Plain English everywhere — never "LI", "ZI", "ATS", "HCM" without saying what it is, never an abbreviation a rep would not know. Leave out any line for a fact you did not find; the note only carries what you established.
+- "needsHuman" is null unless the company identity is genuinely ambiguous (two companies with this name in this state, say) — then one short sentence.`;
+}
+
 // ---------------------------------------------------------------- job runner
 
 // Preflight is server-wide (it is a property of the server's Claude account).
@@ -1507,6 +1612,7 @@ function loadRunFromDisk(userId) {
   const dir = path.join(RUNS, rec.id);
   return {
     id: rec.id, userId, startedAt: rec.startedAt, finishedAt: rec.finishedAt || rec.startedAt, pepm: rec.pepm,
+    mode: rec.mode || 'full',
     restored: true,
     jobs: rec.jobs.map((j) => {
       const result = readJSON(path.join(dir, `${j.leadId}.json`), null);
@@ -1533,14 +1639,15 @@ async function pool(items, limit, worker) {
   await Promise.all(runners);
 }
 
-async function startRun(user, leads, pepm) {
+async function startRun(user, leads, pepm, mode = 'full') {
+  const basic = mode === 'basic';
   const id = newRunId();
   const dir = path.join(RUNS, id);
   fs.mkdirSync(dir, { recursive: true });
   const us = userState(user.id);
 
   const run = us.run = {
-    id, userId: user.id, userName: user.name, startedAt: Date.now(), finishedAt: null, pepm,
+    id, userId: user.id, userName: user.name, startedAt: Date.now(), finishedAt: null, pepm, mode,
     jobs: leads.map((l) => ({
       leadId: l.id, company: l.company, lead: l,
       status: 'queued', progress: [], result: null,
@@ -1554,12 +1661,19 @@ async function startRun(user, leads, pepm) {
   persistRun(run);
   emit('run:start', { run: publicRun(run) }, user.id);
 
-  pool(run.jobs, config.concurrency, async (job) => {
+  // A basic run fans out wide and skips the server-wide semaphore: those sessions
+  // are a dozen tool calls each, and the semaphore exists to stop six deep
+  // research sessions from starving one another, not to serialise a quick sweep.
+  const limit = basic ? Math.max(1, Number(config.basicConcurrency) || 20) : config.concurrency;
+  const runOne = basic
+    ? (prompt, opts) => runClaudeNow(prompt, { ...opts, timeoutMin: Number(config.basicTimeoutMin) || 12 })
+    : runClaude;
+  pool(run.jobs, limit, async (job) => {
     job.status = 'running';
     job.startedAt = Date.now();
     emit('job', { job: publicJob(job) }, user.id);
 
-    const res = await runClaude(profilePrompt(job.lead, pepm), {
+    const res = await runOne(basic ? basicPrompt(job.lead) : profilePrompt(job.lead, pepm), {
       label: job.company,
       cwd: dir,
       logFile: path.join(dir, `${job.leadId}.log.jsonl`),
@@ -1603,6 +1717,7 @@ function persistRun(run) {
     startedAt: run.startedAt,
     finishedAt: run.finishedAt,
     pepm: run.pepm,
+    mode: run.mode || 'full',
     jobs: run.jobs.map((j) => ({
       leadId: j.leadId, company: j.company, status: j.status,
       // The browsed row is kept so a restored run can re-render the picker
@@ -1642,7 +1757,7 @@ const publicJob = (j) => ({
 const publicRun = (run) => run && ({
   id: run.id, userId: run.userId, userName: run.userName, restored: !!run.restored,
   startedAt: run.startedAt, finishedAt: run.finishedAt,
-  pepm: run.pepm, jobs: run.jobs.map(publicJob),
+  pepm: run.pepm, mode: run.mode || 'full', jobs: run.jobs.map(publicJob),
 });
 
 // ---------------------------------------------------------------- stats
@@ -1653,7 +1768,7 @@ function computeStats(scope = {}) {
   const runs = history.runs.filter((r) => !scope.userId || r.userId === scope.userId);
   for (const run of runs) {
     for (const j of run.jobs) {
-      if (j.result) leads.push({ ...j.result, run: run.id, at: run.startedAt, cost: j.cost, durationMs: j.durationMs, written: j.written, userId: run.userId, userName: run.userName });
+      if (j.result) leads.push({ ...j.result, run: run.id, mode: run.mode || 'full', at: run.startedAt, cost: j.cost, durationMs: j.durationMs, written: j.written, userId: run.userId, userName: run.userName });
     }
   }
   // Who has been profiling what — the question a manager asks of a shared tool.
@@ -1671,6 +1786,16 @@ function computeStats(scope = {}) {
   }
   const sum = (a) => a.reduce((x, y) => x + (y || 0), 0);
   const rate = (n) => (leads.length ? n / leads.length : 0);
+
+  // The two profile types cost an order of magnitude apart, so a blended average
+  // would say nothing. Each gets its own line.
+  const byMode = {};
+  for (const m of ['full', 'basic']) {
+    const ls = leads.filter((l) => l.mode === m);
+    byMode[m] = { leads: ls.length, written: ls.filter((l) => l.written).length,
+      avgCost: ls.length ? sum(ls.map((l) => l.cost)) / ls.length : 0, totalCost: sum(ls.map((l) => l.cost)),
+      avgMinutes: ls.length ? sum(ls.map((l) => l.durationMs)) / ls.length / 60000 : 0 };
+  }
 
   // Coverage replaces the old scoring rubric. The question these answer is "is the
   // research working", not "is this lead good" — the second question is the rep's,
@@ -1708,6 +1833,7 @@ function computeStats(scope = {}) {
     totalRuns: runs.length,
     totalLeads: leads.length,
     byPerson: Object.values(byPerson).sort((a, b) => b.leads - a.leads),
+    byMode,
     coverage,
     providerCounts,
     writtenCount: leads.filter((l) => l.written).length,
@@ -1719,7 +1845,7 @@ function computeStats(scope = {}) {
     avgMinutes: leads.length ? sum(leads.map((l) => l.durationMs)) / leads.length / 60000 : 0,
     byVertical,
     recentRuns: runs.slice(-12).reverse().map((r) => ({
-      id: r.id, at: r.startedAt, n: r.jobs.length, userName: r.userName || null,
+      id: r.id, at: r.startedAt, n: r.jobs.length, userName: r.userName || null, mode: r.mode || 'full',
       done: r.jobs.filter((j) => j.status === 'done' || j.status === 'written').length,
       written: r.jobs.filter((j) => j.written).length,
     })),
@@ -1859,7 +1985,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/state') {
       // Non-admins get the config fields the Run screen needs and nothing that
       // could reveal or change how the server is wired.
-      const cfg = admin ? config : { pepm: config.pepm, concurrency: config.concurrency, maxSessions: config.maxSessions };
+      const cfg = admin ? config : { pepm: config.pepm, concurrency: config.concurrency, basicConcurrency: config.basicConcurrency, maxSessions: config.maxSessions };
       return send(res, 200, {
         user: publicUser(user), scope: leadScope(user), admin,
         config: cfg, segments, preflight: state.preflight,
@@ -1874,11 +2000,13 @@ const server = http.createServer(async (req, res) => {
       if (!admin) {
         // A rep may set their own PEPM box; that is the one shared setting they touch.
         if (body.pepm) { config.pepm = Number(body.pepm) || config.pepm; writeJSON(CONFIG_PATH, config); }
-        return send(res, 200, { config: { pepm: config.pepm, concurrency: config.concurrency, maxSessions: config.maxSessions } });
+        return send(res, 200, { config: { pepm: config.pepm, concurrency: config.concurrency, basicConcurrency: config.basicConcurrency, maxSessions: config.maxSessions } });
       }
-      const allowed = ['pepm', 'concurrency', 'maxSessions', 'claudeCmd', 'model', 'perLeadTimeoutMin'];
+      const allowed = ['pepm', 'concurrency', 'basicConcurrency', 'basicTimeoutMin', 'maxSessions', 'claudeCmd', 'model', 'perLeadTimeoutMin'];
       for (const k of allowed) if (body[k] !== undefined) config[k] = body[k];
       config.concurrency = Math.max(1, Math.min(8, Number(config.concurrency) || 3));
+      config.basicConcurrency = Math.max(1, Math.min(40, Number(config.basicConcurrency) || 20));
+      config.basicTimeoutMin = Math.max(3, Math.min(30, Number(config.basicTimeoutMin) || 12));
       config.maxSessions = Math.max(1, Math.min(24, Number(config.maxSessions) || 6));
       writeJSON(CONFIG_PATH, config);
       // Let anyone queued behind an old cap through if it just went up.
@@ -2093,10 +2221,12 @@ const server = http.createServer(async (req, res) => {
       if (sc.lockOwner && chosen.some((l) => !l.owner || String(l.owner.id) !== String(sc.lockOwner))) {
         return send(res, 403, { error: 'One or more of those leads is not owned by you in Zoho.' });
       }
-      if (chosen.length > 50) return send(res, 400, { error: 'Fifty leads per run at most.' });
+      const mode = body.mode === 'basic' ? 'basic' : 'full';
+      if (mode === 'full' && chosen.length > 50) return send(res, 400, { error: 'Fifty leads per comprehensive run at most. Use Basic profile for a larger sweep.' });
+      if (mode === 'basic' && chosen.length > 300) return send(res, 400, { error: 'Three hundred leads per basic run at most.' });
       const pepm = body.pepm || config.pepm;
       if (pepm !== config.pepm) { config.pepm = pepm; writeJSON(CONFIG_PATH, config); }
-      const id = await startRun(user, chosen, pepm);
+      const id = await startRun(user, chosen, pepm, mode);
       return send(res, 200, { runId: id });
     }
 
@@ -2109,13 +2239,14 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, { queued: jobs.length });
 
       const direct = zohoConfigured();
-      pool(jobs, direct ? config.concurrency : Math.min(2, config.concurrency), async (job) => {
+      const writeLimit = direct ? (run.mode === 'basic' ? 6 : config.concurrency) : Math.min(2, config.concurrency);
+      pool(jobs, writeLimit, async (job) => {
         job.status = 'writing';
         emit('job', { job: publicJob(job) }, user.id);
         if (direct) {
           emit('progress', { leadId: job.leadId, kind: 'note', msg: 'Writing to Zoho directly…' }, user.id);
           try {
-            job.writeResult = await writeLeadDirect(job.result);
+            job.writeResult = await writeLeadDirect(job.result, run.mode || 'full');
           } catch (err) {
             job.writeResult = { ok: false, partial: false, leadId: job.leadId, fieldsWritten: [], notesWritten: [], newLeadId: null, skipped: [], error: err.message };
           }
@@ -2126,7 +2257,7 @@ const server = http.createServer(async (req, res) => {
               : job.writeResult.error || 'Write failed.',
           }, user.id);
         } else {
-          const r = await runClaude(writePrompt(job.result, run.pepm), {
+          const r = await runClaude(writePrompt(job.result, run.pepm, run.mode || 'full'), {
             label: `write ${job.company}`, timeoutMin: 10,
             cwd: path.join(RUNS, run.id),
             logFile: path.join(RUNS, run.id, `${job.leadId}.write.jsonl`),
