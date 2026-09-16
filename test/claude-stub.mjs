@@ -43,6 +43,7 @@ process.stdin.on('end', () => {
         { firstName: 'Ana', lastName: 'Cruz', title: 'CFO', functionalRole: 'CFO', directPhone: '212-555-3434', email: 'ana@x.com', source: 'company website', date: '9/1/2026' },
         { firstName: 'Bo', lastName: 'Kim', title: 'COO', mobilePhone: '917-555-0101', source: 'ZoomInfo', date: '9/1/2026' },
         { firstName: 'No', lastName: 'Phone', title: 'CIO', email: 'no@x.com' },
+        { firstName: 'Dee', lastName: 'Ennsee', title: 'President', directPhone: '212-555-9999', directPhoneDNC: true, source: 'ZoomInfo', date: '9/1/2026' },
         { firstName: 'Ghost', lastName: '', title: 'CEO' },
       ],
       entities: [], additionalContacts: [], fields: { Description: `${company} does things.\n· ONE — two (site) [9/1/2026]`, Employee_Count: 40, HCM: 'not found', Website: '' },

@@ -70,7 +70,7 @@ assert.equal(s.run.jobs[0].result.contact.firstName, 'Pat'); assert.equal(s.run.
   const r0 = s.run.jobs[0].result;
   assert.equal(r0.employees, 40); assert.equal(r0.contactChanged, false); assert.equal(r0.contact.email, 'pat@x.com'); ok('normalizer: numbers and booleans coerced, email cleaned');
   assert.equal(r0.fields.HCM, undefined); assert.equal(r0.fields.Website, undefined); assert.equal(r0.fields.Employee_Count, 40); ok('normalizer: absence values and empty fields dropped');
-  assert.equal(r0.leadership.length, 4); assert.equal(r0.leadershipPhones, 3); assert.equal(r0.coverage.leadershipPhones, true); ok('normalizer: leadership roster kept (nameless entry dropped), phones counted');
+  assert.equal(r0.leadership.length, 5); assert.equal(r0.leadershipPhones, 4); assert.equal(r0.coverage.leadershipPhones, true); ok('normalizer: leadership roster kept (nameless entry dropped), phones counted');
   assert.equal(s.run.jobs[0].mode, 'full'); assert.equal(s.run.jobs[0].attempts.length, 1); ok('job carries its mode and one attempt');
 }
 assert.ok(fs.existsSync(path.join(STORE, 'runs', runId, '5001.json'))); ok('result JSON persisted on the volume');

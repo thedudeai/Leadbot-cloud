@@ -1102,10 +1102,13 @@ async function writeLeadDirect(result, mode = 'full') {
     const used = new Set([primaryKey, ...extras.map((p) => personName(p).toLowerCase())]);
     for (const p of roster) {
       if (extras.length >= 2) break;
-      if (used.has(p.name.toLowerCase()) || !(p.directPhone || p.mobilePhone)) continue;
+      // A number flagged Do Not Call never goes into a field a rep dials from; the
+      // note carries it with the warning, the field does not carry it at all.
+      const dialable = (p.directPhone && !p.directPhoneDNC) ? p.directPhone : (p.mobilePhone && !p.mobilePhoneDNC) ? p.mobilePhone : '';
+      if (used.has(p.name.toLowerCase()) || !dialable) continue;
       used.add(p.name.toLowerCase());
       extras.push({ firstName: p.firstName, lastName: p.lastName, title: p.title, email: p.email,
-        directPhone: p.directPhone || p.mobilePhone, functionalRole: p.functionalRole, reason: 'leadership roster' });
+        directPhone: dialable, functionalRole: p.functionalRole, reason: 'leadership roster' });
     }
   }
   extras.forEach((p, i) => {
@@ -1409,6 +1412,7 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd, model,
     const log = logFile ? fs.createWriteStream(logFile, { flags: 'a' }) : null;
     let done = false;
     let stopped = null;          // why the server ended the session, if it did
+    let resultSeen = false;      // the CLI's final result event has been parsed
 
     const note = (msg, kind = 'note') => {
       if (events.length < 600) events.push({ kind, msg, at: Date.now() });
@@ -1426,11 +1430,16 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd, model,
       done = true;
       clearTimeout(hardTimer); clearInterval(idleTimer); clearTimeout(forceTimer);
       liveChildren.delete(child);
+      // A last line with no trailing newline is still a line.
+      if (buf.trim()) { handleLine(buf.trim()); buf = ''; }
       log?.end();
       const json = structured || extractJSON(finalText);
       const budgetHit = subtype === 'error_max_budget_usd';
       if (cost == null && (usage.in || usage.out || usage.cacheRead)) { cost = estimateCost(m, usage); costEstimated = true; }
-      const ok = !stopped && !budgetHit && code === 0 && !!json;
+      // A session whose result already arrived is a success even if the process
+      // was then killed during its own teardown by a timer that fired late.
+      const ok = !budgetHit && !!json && (resultSeen ? subtype === 'success' : (!stopped && code === 0));
+      if (ok) stopped = null;
       resolve({
         ok, code, json, text: finalText, events, cost, costEstimated, usage, turns, toolCalls, stopped: stopped || (budgetHit ? 'budget' : null),
         error: ok ? null
@@ -1445,6 +1454,7 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd, model,
     let forceTimer = null;
     const stop = (reason) => {
       if (done || stopped) return;
+      if (resultSeen) { killTree('SIGTERM'); setTimeout(() => finish(0), 500); return; }   // answered already, just tidy up
       stopped = reason;
       note(`stopping session — ${reason}`);
       killTree('SIGTERM');
@@ -1469,16 +1479,9 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd, model,
     child.stdin.write(prompt);
     child.stdin.end();
 
-    child.stdout.on('data', (chunk) => {
-      lastOutput = Date.now();
-      buf += chunk.toString();
-      let nl;
-      while ((nl = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
+    const handleLine = (line) => {
         let ev;
-        try { ev = JSON.parse(line); } catch { continue; }
+        try { ev = JSON.parse(line); } catch { return; }
         log?.write(line + '\n');
         if (ev.type === 'assistant' && ev.message?.content) {
           const u = ev.message.usage;
@@ -1500,7 +1503,17 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd, model,
           if (ev.structured_output && typeof ev.structured_output === 'object') structured = ev.structured_output;
           subtype = ev.subtype || null;
           cost = ev.total_cost_usd ?? cost;
+          resultSeen = true;
         }
+    };
+    child.stdout.on('data', (chunk) => {
+      lastOutput = Date.now();
+      buf += chunk.toString();
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (line) handleLine(line);
       }
     });
 
