@@ -85,6 +85,33 @@ console.log('  rep stats tile:', (await r.textContent('#stats-body .tile .n')));
 if (!(await r.textContent('#stats-body')).includes('basic profiles')) throw new Error('stats missing basic tile');
 await r.click('#pw').catch(() => {});
 
+// a full run where one session runs away: the live screen shows the Stop button
+// while it runs, the lead comes back as a basic fallback, and Review renders it
+// inside the comprehensive table with the leadership column and its detail panel.
+{
+  const cfg = await r.evaluate(async () => (await (await fetch('/api/state')).json()).config);
+  await a.click('nav button[data-v="setup"]'); await a.fill('#c-callsfull', '25'); await a.click('#c-save'); await wait(300);
+  await r.evaluate(() => fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ leads: [{ id: '9001', company: 'Runaway Inc' }, { id: '9002', company: 'Delta Co' }] }) }));
+  await r.click('nav button[data-v="run"]');
+  await r.waitForSelector('#stop-run', { timeout: 10000 });
+  await r.waitForSelector('#live .pill.flag:text-is("fell back to basic")', { timeout: 60000 });
+  await r.waitForSelector('#nb-review:text-is("2")', { timeout: 30000 });
+  await r.click('nav button[data-v="review"]'); await r.waitForSelector('#review-body tbody tr');
+  const body = await r.textContent('#review-body');
+  if (!body.includes('basic fallback') || !body.includes('came back as a basic profile')) throw new Error('fallback row/banner missing');
+  if (!(await r.textContent('#review-body thead')).includes('Leadership')) throw new Error('leadership column missing');
+  if (!body.includes('with a number')) throw new Error('leadership cell missing');
+  for (const t of await r.locator('#review-body .toggle').all()) { await t.click(); await wait(150); }
+  const det = await r.textContent('#review-body');
+  if (!det.includes('Leadership roster') || !det.includes('Why this is a basic profile')) throw new Error('detail panels missing roster/fallback rows');
+  await r.screenshot({ path: path.join(ROOT, 'test', 'shot-rep-review-fallback.png'), fullPage: true });
+  console.log('  fallback lead rendered in review with the leadership column');
+  await a.click('nav button[data-v="setup"]'); await wait(200);
+  if ((await a.inputValue('#c-model')) !== 'sonnet' || (await a.inputValue('#c-costfull')) !== '6') throw new Error('setup hard-stop fields not populated');
+  console.log('  setup shows model + hard stops');
+  void cfg;
+}
+
 // admin sees rep's run in Everyone stats
 await a.click('nav button[data-v="stats"]'); await a.click('#stats-scope button[data-scope="all"]'); await wait(500);
 console.log('  admin everyone-stats has by-person:', (await a.textContent('#stats-body')).includes('Rep One'));

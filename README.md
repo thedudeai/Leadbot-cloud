@@ -27,6 +27,7 @@ a login in front of it so the whole payroll team can use one deployment.
 | Leads at once | `concurrency` (default 3) under the company-wide `maxSessions` cap | `basicConcurrency` (default 20), outside the company-wide cap |
 | Per run | up to 50 | up to 300 |
 | Timeout | `perLeadTimeoutMin` (25) | `basicTimeoutMin` (12) |
+| Cost cap / tool-call wall | `maxCostFull` ($6) / `maxToolCallsFull` (100) | `maxCostBasic` ($0.75) / `maxToolCallsBasic` (16) |
 | Zoho label | `Profile_Type = Comprehensive` | `Profile_Type = Basic` |
 
 Both buttons sit under the lead table and take the same selection. A basic run writes the contact,
@@ -35,9 +36,46 @@ Description and a single **BASIC PROFILE** note. `Profile_Type` is a picklist on
 10 Sep 2026); the picker shows it next to "Last profiled" so a rep can see which leads have only
 had the light pass.
 
-The profile prompt, the skill files, the review gate, the scrub/date/picklist enforcement in the
-write path and the Zoho REST calls are unchanged. `runClaude` still spawns
-`claude -p --output-format stream-json --permission-mode bypassPermissions`.
+The review gate, the scrub/date/picklist enforcement in the write path and the Zoho REST calls
+are unchanged. `runClaude` spawns `claude -p --output-format stream-json --permission-mode
+bypassPermissions --model <model> --max-budget-usd <cap> --json-schema <shape> --disallowed-tools
+<file and shell tools>` directly (no shell), in its own process group.
+
+## Hard stops, the fallback ladder, and the leadership roster (16 Sep 2026)
+
+**Every session has four independent hard stops** (Setup → Hard stops): a dollar cap enforced by
+the CLI itself (`maxCostFull` $6, `maxCostBasic` $0.75), a tool-call wall counted by the server
+(`maxToolCallsFull` 100, `maxToolCallsBasic` 16), the per-lead timeout, and an idle watchdog
+(`idleKillMin` 6 — no output from the CLI for that long means it is hung). A stop kills the whole
+process group and resolves the job whether or not the process obliges — the old build held a
+shell, killed the shell, and left the real CLI running as an orphan for hours with its session
+slot never released. **Stop this run** on the live screen kills every session in the run.
+
+**Fallback:** a comprehensive session that is stopped or comes back empty is followed by one
+basic pass (`fallbackToBasic`), so the lead still gets six facts, a description and a leadership
+roster. Such a lead is marked *fell back to basic* in the live feed and Review, writes as
+`Profile_Type = Basic`, and can be re-run later. No lead ever runs more than two sessions.
+
+**The leadership roster:** every profile returns `leadership` — every owner, partner and C-level
+person the research could name, with direct dial, mobile and email. The server writes it to the
+record as a **LEADERSHIP CONTACTS** note (one bold-headlined line per person) and fills any empty
+additional-contact slot from it, most senior person with a phone first. The Review table shows
+"N of M with a number" per lead; Stats shows leadership phones per lead.
+
+**One prompt, every model.** The four skill files are no longer read by sessions. Their content is
+condensed into `skill/zoho-lead-profiler/HEADLESS.md` (~9k tokens instead of ~32k) and inlined
+into the prompt, and the basic prompt carries the same style section verbatim. Output shape is
+forced by a JSON schema and then normalized server-side (`normalizeProfile`), and every note is
+shaped by the same write pipeline. Switching `model` (Setup → Research model; default `sonnet`)
+changes research depth and cost, never what a record looks like. Preflight and the fetch fallback run on
+`utilityModel` (`haiku`). Preflight also discovers the real MCP tool names on
+the server and rewrites the prompts to match — **run it once after deploying.**
+
+**Other fixes in the same pass:** a lead profiled in the last seven days is refused unless you
+confirm; Zoho API calls time out at 30 s instead of hanging a write forever; a crash in one lead
+no longer takes the run down; stopped sessions get an estimated cost from their token usage
+(marked *est.*) so Stats stops under-counting them; `config.json` from an earlier version gets the
+new defaults and `model` is migrated from '' (the CLI's priciest default) to `sonnet`.
 
 ## Files
 

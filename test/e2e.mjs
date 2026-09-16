@@ -41,7 +41,8 @@ r = await call('anon', '/api/login', { email: 'boss@chs.test', password: 'wrong'
 // 2. Admin login + state
 r = await call('admin', '/api/login', { email: 'BOSS@chs.test', password: 'adminpass123' }); assert.equal(r.status, 200); assert.equal(r.json.user.role, 'admin'); ok('admin login (case-insensitive email)');
 r = await call('admin', '/api/state'); assert.equal(r.json.admin, true); assert.equal(r.json.config.claudeCmd, 'claude'); ok('admin sees full config');
-r = await call('admin', '/api/config', { claudeCmd: `node ${path.join(ROOT, 'test', 'claude-stub.mjs')}`, maxSessions: 2, concurrency: 3 }); assert.equal(r.json.config.maxSessions, 2); ok('admin saves settings incl. maxSessions');
+r = await call('admin', '/api/config', { claudeCmd: `node ${path.join(ROOT, 'test', 'claude-stub.mjs')}`, maxSessions: 2, concurrency: 3, maxToolCallsFull: 25, idleKillMin: 2 }); assert.equal(r.json.config.maxSessions, 2); assert.equal(r.json.config.maxToolCallsFull, 25); ok('admin saves settings incl. maxSessions and the tool-call wall');
+assert.equal(r.json.config.model, 'sonnet'); assert.equal(r.json.config.maxCostFull, 6); assert.equal(r.json.config.fallbackToBasic, true); ok('defaults: Sonnet, $6 cap, fallback on');
 
 // 3. Team
 r = await call('admin', '/api/users', { name: 'Rep One', email: 'rep@chs.test', password: 'reppass123' }); assert.equal(r.status, 200); const rep = r.json.user; assert.equal(rep.role, 'user'); ok('admin creates a rep');
@@ -65,11 +66,41 @@ assert.equal(r.status, 200); const runId = r.json.runId; ok('rep starts a 2-lead
 r = await call('rep', '/api/run', { leads: [{ id: '5003', company: 'C', owner: { id: '999' } }] }); assert.equal(r.status, 409); ok('second concurrent run refused');
 let s = await pollRun('rep', (x) => x.run && x.run.finishedAt && x.run.jobs.every((j) => j.status === 'done'));
 assert.equal(s.run.jobs[0].result.contact.firstName, 'Pat'); assert.equal(s.run.jobs[0].cost, 0.42); ok('both leads profiled by the stub, cost captured');
+{
+  const r0 = s.run.jobs[0].result;
+  assert.equal(r0.employees, 40); assert.equal(r0.contactChanged, false); assert.equal(r0.contact.email, 'pat@x.com'); ok('normalizer: numbers and booleans coerced, email cleaned');
+  assert.equal(r0.fields.HCM, undefined); assert.equal(r0.fields.Website, undefined); assert.equal(r0.fields.Employee_Count, 40); ok('normalizer: absence values and empty fields dropped');
+  assert.equal(r0.leadership.length, 4); assert.equal(r0.leadershipPhones, 3); assert.equal(r0.coverage.leadershipPhones, true); ok('normalizer: leadership roster kept (nameless entry dropped), phones counted');
+  assert.equal(s.run.jobs[0].mode, 'full'); assert.equal(s.run.jobs[0].attempts.length, 1); ok('job carries its mode and one attempt');
+}
 assert.ok(fs.existsSync(path.join(STORE, 'runs', runId, '5001.json'))); ok('result JSON persisted on the volume');
 r = await call('admin', '/api/state'); assert.equal(r.json.run, null); ok("admin's own run state is untouched by the rep's run");
 r = await call('rep', '/api/write', { leadIds: ['5001'] }); assert.equal(r.json.queued, 1); ok('rep queues one write');
 s = await pollRun('rep', (x) => x.run.jobs.find((j) => j.leadId === '5001').written);
 assert.equal(s.run.jobs.find((j) => j.leadId === '5002').written, false); ok('only the approved lead was written');
+
+// 5a. Hard stops and the fallback ladder
+r = await call('rep', '/api/run', { leads: [{ id: '5501', company: 'Runaway Inc', owner: { id: '999' } }, { id: '5502', company: 'Gamma LLC', owner: { id: '999' } }] });
+assert.equal(r.status, 200); const runawayRun = r.json.runId; ok('run with a never-converging session started ' + runawayRun);
+s = await pollRun('rep', (x) => x.run && x.run.id === runawayRun && x.run.finishedAt, 200);
+{
+  const j = s.run.jobs.find((x) => x.leadId === '5501');
+  assert.equal(j.status, 'done'); assert.ok(j.fallback && /25 tool calls/.test(j.fallback.reason), JSON.stringify(j.fallback)); ok('runaway session was killed at the tool-call wall');
+  assert.equal(j.mode, 'basic'); assert.equal(j.result.basic.hcm, 'Paylocity'); assert.equal(j.attempts.length, 2); assert.equal(j.attempts[0].stopped, 'used more than 25 tool calls'); ok('…and the lead came back as a basic-profile fallback');
+  assert.equal(s.run.jobs.find((x) => x.leadId === '5502').status, 'done'); ok('the other lead in the run was unaffected');
+  const h = await fetch(BASE + '/healthz').then((x) => x.json()); assert.equal(h.liveSessions, 0); assert.equal(h.liveProcesses, 0); ok('no session slot or process leaked after the kill');
+}
+r = await call('rep', '/api/run', { leads: [{ id: '5601', company: 'Hung Inc', owner: { id: '999' } }, { id: '5602', company: 'Hung Inc', owner: { id: '999' } }, { id: '5603', company: 'Hung Inc', owner: { id: '999' } }, { id: '5604', company: 'Hung Inc', owner: { id: '999' } }] });
+assert.equal(r.status, 200); const hungRun = r.json.runId; ok('run with hung sessions started ' + hungRun);
+await wait(800);
+r = await call('rep', '/api/run/cancel', {}); assert.equal(r.status, 200); assert.ok(r.json.killed >= 1); ok('Stop this run killed ' + r.json.killed + ' live sessions');
+s = await pollRun('rep', (x) => x.run && x.run.id === hungRun && x.run.finishedAt, 200);
+assert.equal(s.run.cancelled, 'Rep One'); assert.ok(s.run.jobs.every((j) => j.status === 'failed')); assert.ok(s.run.jobs.some((j) => /stopped by Rep One/.test(j.error))); ok('cancelled run finished with every lead failed and the reason recorded');
+{ const h = await fetch(BASE + '/healthz').then((x) => x.json()); assert.equal(h.liveSessions, 0); assert.equal(h.liveProcesses, 0); ok('nothing leaked after the cancel'); }
+r = await call('rep', '/api/run', { leads: [{ id: '5701', company: 'Recent Co', owner: { id: '999' }, profiledDate: new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10) }] });
+assert.equal(r.status, 409); assert.equal(r.json.error, 'recent'); assert.equal(r.json.recent[0].id, '5701'); ok('a lead profiled two days ago is refused without force');
+r = await call('rep', '/api/run', { force: true, leads: [{ id: '5701', company: 'Recent Co', owner: { id: '999' }, profiledDate: '2026-09-14' }] });
+assert.equal(r.status, 200); s = await pollRun('rep', (x) => x.run && x.run.finishedAt, 100); ok('…and accepted with force');
 
 // 5b. Basic run — wide fan-out, own mode label, own review shape
 r = await call('rep', '/api/run', { mode: 'basic', leads: Array.from({ length: 25 }, (_, i) => ({ id: String(6000 + i), company: 'Basic Co ' + i, owner: { id: '999' } })) });
@@ -86,8 +117,8 @@ assert.equal(r.status, 400); assert.match(r.json.error, /Basic profile/); ok('51
 
 // 6. Stats
 r = await call('rep', '/api/stats?scope=all'); assert.equal(r.status, 403); ok('rep cannot see everyone stats');
-r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 27); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
-assert.equal(r.json.byMode.basic.leads, 25); assert.equal(r.json.byMode.full.leads, 2); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
+r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 30); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
+assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 4); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
 r = await call('admin', '/api/stats'); assert.equal(r.json.totalLeads, 0); ok("admin's own stats are separate");
 
 // 7. Restart → restore

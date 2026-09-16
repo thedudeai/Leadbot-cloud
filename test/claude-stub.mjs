@@ -19,18 +19,40 @@ process.stdin.on('end', () => {
       fields: { Description: `${company} operates four skilled nursing facilities in Ohio.`, Employee_Count: 310, Number_of_Locations: '4', HCM: 'Paylocity', City: 'Lakewood', State: 'NJ' },
       notes: { 'BASIC PROFILE': '· OWNED BY TWO PARTNERS — Sam Roth and Dina Klein. (ZoomInfo) [9/10/2026]' }, needsHuman: null };
   }
+  else if (prompt.includes('- Company: Runaway Inc')) {
+    // A session that never converges: one tool call every 50ms, forever. The
+    // server's tool-call wall has to end it, and the basic fallback has to run.
+    const tick = () => { say({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebSearch', input: { query: 'again' } }] } }); setTimeout(tick, 50); };
+    tick();
+    return;
+  }
+  else if (prompt.includes('- Company: Hung Inc')) {
+    // A session that goes silent: prints one line, then nothing, ever. The idle
+    // watchdog (or a Stop from the dashboard) has to end it.
+    say({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebSearch', input: { query: 'then silence' } }] } });
+    setInterval(() => {}, 1 << 30);
+    return;
+  }
   else {
     const id = (prompt.match(/Zoho record id: (\d+)/) || [])[1];
     const company = (prompt.match(/- Company: (.*)/) || [])[1];
-    json = { leadId: id, company, disqualified: null, employees: 40, employeesBasis: 'stated', contactChanged: false,
-      contact: { firstName: 'Pat', lastName: 'Lee', title: 'CEO', priority: 1, email: 'pat@x.com', emailVerified: true, directPhone: '2125551212', directPhoneVerified: true, employmentVerifiedBy: 'LinkedIn 9/1/2026', reachable: true },
-      entities: [], additionalContacts: [], fields: { Description: `${company} does things.\n· ONE — two (site) [9/1/2026]`, Employee_Count: 40 },
-      notes: { 'PAYROLL FINDINGS': 'STAFF — forty people on payroll. (site) [9/1/2026]' }, needsHuman: null,
+    json = { leadId: id, company, disqualified: null, employees: '40', employeesBasis: 'stated', contactChanged: 'false',
+      contact: { firstName: 'Pat', lastName: 'Lee', title: 'CEO', priority: 1, email: 'PAT@x.com ', emailVerified: true, directPhone: '2125551212', directPhoneVerified: true, employmentVerifiedBy: 'LinkedIn 9/1/2026', reachable: true },
+      leadership: [
+        { firstName: 'Pat', lastName: 'Lee', title: 'CEO', directPhone: '2125551212', source: 'ZoomInfo', date: '9/1/2026' },
+        { firstName: 'Ana', lastName: 'Cruz', title: 'CFO', functionalRole: 'CFO', directPhone: '212-555-3434', email: 'ana@x.com', source: 'company website', date: '9/1/2026' },
+        { firstName: 'Bo', lastName: 'Kim', title: 'COO', mobilePhone: '917-555-0101', source: 'ZoomInfo', date: '9/1/2026' },
+        { firstName: 'No', lastName: 'Phone', title: 'CIO', email: 'no@x.com' },
+        { firstName: 'Ghost', lastName: '', title: 'CEO' },
+      ],
+      entities: [], additionalContacts: [], fields: { Description: `${company} does things.\n· ONE — two (site) [9/1/2026]`, Employee_Count: 40, HCM: 'not found', Website: '' },
+      notes: { 'PAYROLL FINDINGS': 'STAFF — forty people on payroll. (site) [9/1/2026]', 'COMPLIANCE': 'No violations found.' }, needsHuman: null,
       coverage: { directPhone: true, email: true, provider: false, headcount: true, socialIcebreaker: false, publicRecord: false } };
   }
   say({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebSearch', input: { query: 'stub search' } }] } });
   setTimeout(() => {
-    say({ type: 'result', result: '```json\n' + JSON.stringify(json) + '\n```', total_cost_usd: prompt.includes('BASIC PROFILE of one company') ? 0.05 : 0.42 });
+    const structured = prompt.includes('the structured output') ? json : undefined;
+    say({ type: 'result', subtype: 'success', result: structured ? JSON.stringify(json) : '```json\n' + JSON.stringify(json) + '\n```', structured_output: structured, total_cost_usd: prompt.includes('BASIC PROFILE of one company') ? 0.05 : 0.42 });
     process.exit(0);
   }, 300);
 });

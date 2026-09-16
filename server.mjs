@@ -44,11 +44,28 @@ const DEFAULT_CONFIG = {
   maxSessions: 6,               // server-wide — total comprehensive sessions alive at any moment
   basicTimeoutMin: 12,          // a basic session that runs longer than this is doing too much
   claudeCmd: 'claude',
-  model: '',                    // '' = whatever the CLI defaults to
+  // The research model. An alias ('sonnet', 'opus', 'fable') or a full model name. Every
+  // mode sends the same prompt and the server shapes the output the same way, so switching
+  // this changes research depth and cost, never the shape of what lands in Zoho.
+  model: 'sonnet',
+  fallbackModel: '',            // used by the CLI only when `model` is overloaded or unavailable
+  utilityModel: 'haiku',        // preflight and the fetch fallback — trivial JSON tasks
   permissionMode: 'bypassPermissions',
   perLeadTimeoutMin: 25,
+  // Hard stops. Each one ends the session on its own; together they are what makes a
+  // runaway lead impossible. A stopped comprehensive session falls back to a basic pass.
+  maxCostFull: 6,               // dollars per comprehensive session (CLI --max-budget-usd)
+  maxCostBasic: 0.75,           // dollars per basic session
+  maxToolCallsFull: 100,        // the prompt budgets 80; this is the wall behind it
+  maxToolCallsBasic: 16,        // the prompt budgets 12
+  idleKillMin: 6,               // no output from the CLI for this long = hung, kill it
+  fallbackToBasic: true,        // comprehensive fails or is stopped -> run the basic profile instead
   port: 8765,
 };
+// Settings that only exist since this version get their defaults even when an older
+// config.json on the volume predates them. `model` gets one migration: the old default
+// was '' (the CLI's own default, the most expensive tier) and the user chose Sonnet.
+const CONFIG_VERSION = 3;
 
 const DEFAULT_SEGMENTS = [
   {
@@ -75,6 +92,10 @@ const DEFAULT_SEGMENTS = [
 ];
 
 let config = { ...DEFAULT_CONFIG, ...readJSON(CONFIG_PATH, {}) };
+if ((config.configVersion || 0) < CONFIG_VERSION) {
+  if (!config.model) config.model = DEFAULT_CONFIG.model;
+  config.configVersion = CONFIG_VERSION;
+}
 let segments = readJSON(SEGMENTS_PATH, null) || readJSON(path.join(HERE, 'segments.default.json'), null) || DEFAULT_SEGMENTS;
 let history = readJSON(HISTORY_PATH, null) || { runs: [] };
 writeJSON(CONFIG_PATH, config);
@@ -206,6 +227,7 @@ async function zohoAccessToken(force = false) {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
+    signal: AbortSignal.timeout(20_000),
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok || !j.access_token) {
@@ -229,6 +251,8 @@ async function zohoAccessToken(force = false) {
  */
 async function zohoApi(pathAndQuery, { method = 'GET', body = null } = {}) {
   const call = async (token) => {
+    // A Zoho call that never answers used to hang the write (and the run behind it)
+    // for good. Thirty seconds is generous for a single record.
     const r = await fetch(apiHost() + pathAndQuery, {
       method,
       headers: {
@@ -236,6 +260,7 @@ async function zohoApi(pathAndQuery, { method = 'GET', body = null } = {}) {
         ...(body ? { 'Content-Type': 'application/json' } : {}),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(30_000),
     });
     if (r.status === 204) return { status: 204, json: null };
     const text = await r.text();
@@ -718,9 +743,85 @@ function entityLines(entities) {
   });
 }
 
+// --- the leadership roster ----------------------------------------------------
+// The strongest thing this product delivers is phone numbers for the people who can
+// say yes. Every profile returns `leadership`: every owner, partner and C-level
+// person the research could name, with the best numbers and email for each. The
+// note built from it is written by the server, so it reads the same whether the
+// research ran on Sonnet, Opus or Fable.
+const cleanStr = (v) => (v == null ? '' : String(v).trim());
+const cleanPhone = (v) => { const s = cleanStr(v); return s && /\d{7}/.test(s.replace(/\D/g, '')) && !isAbsence(s) ? s : ''; };
+const cleanEmail = (v) => { const s = cleanStr(v).toLowerCase(); return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s) ? s : ''; };
+
+function personName(p) { return [cleanStr(p.firstName), cleanStr(p.lastName)].filter(Boolean).join(' '); }
+
+// Owners and C-level first, then the rest; within a tier, people with a phone first.
+const TITLE_RANK = [
+  [/\b(owner|founder|co-founder|proprietor|partner|managing member|principal)\b/i, 1],
+  [/\b(ceo|chief executive|president|managing director|executive director|administrator)\b/i, 2],
+  [/\b(cfo|coo|cio|cto|chro|chief|controller|treasurer)\b/i, 3],
+  [/\b(vp|vice president|head of|director)\b/i, 4],
+];
+const titleRank = (t) => { const s = cleanStr(t); for (const [re, r] of TITLE_RANK) if (re.test(s)) return r; return 5; };
+
+function leadershipRoster(result) {
+  const seen = new Set();
+  const out = [];
+  const add = (p, extra = {}) => {
+    if (!p || typeof p !== 'object') return;
+    const name = personName(p);
+    if (!name || isAbsence(name)) return;
+    const key = name.toLowerCase();
+    if (seen.has(key)) {
+      // Same person twice (the primary is usually on the roster too): keep the first
+      // entry and fill in anything it was missing from the second.
+      const cur = out.find((x) => x.name.toLowerCase() === key);
+      const fill = { title: cleanStr(p.title), directPhone: cleanPhone(p.directPhone || p.phone), mobilePhone: cleanPhone(p.mobilePhone || p.mobile),
+        email: cleanEmail(p.email), linkedin: cleanStr(p.linkedin), source: cleanStr(p.source || p.phoneSource), date: cleanStr(p.date), functionalRole: cleanStr(p.functionalRole) };
+      for (const [k, v] of Object.entries(fill)) if (!cur[k] && v && !isAbsence(v)) cur[k] = v;
+      return;
+    }
+    seen.add(key);
+    out.push({
+      firstName: cleanStr(p.firstName), lastName: cleanStr(p.lastName), name,
+      title: isAbsence(cleanStr(p.title)) ? '' : cleanStr(p.title),
+      directPhone: cleanPhone(p.directPhone || p.phone), mobilePhone: cleanPhone(p.mobilePhone || p.mobile),
+      email: cleanEmail(p.email), linkedin: cleanStr(p.linkedin),
+      directPhoneDNC: !!p.directPhoneDNC, mobilePhoneDNC: !!p.mobilePhoneDNC,
+      source: isAbsence(cleanStr(p.source || p.phoneSource)) ? '' : cleanStr(p.source || p.phoneSource),
+      date: cleanStr(p.date), functionalRole: cleanStr(p.functionalRole), ...extra,
+    });
+  };
+  // The primary is on the roster too — a rep wants one list of everyone who can pick up.
+  if (result.contact) add(result.contact, { primary: true });
+  for (const p of Array.isArray(result.leadership) ? result.leadership : []) add(p);
+  for (const p of Array.isArray(result.additionalContacts) ? result.additionalContacts : []) add(p);
+  return out.sort((a, b) => (a.primary ? -1 : b.primary ? 1 : 0)
+    || titleRank(a.title) - titleRank(b.title)
+    || ((b.directPhone || b.mobilePhone) ? 1 : 0) - ((a.directPhone || a.mobilePhone) ? 1 : 0));
+}
+
+// One line per person: headline is the name, then title and every way to reach them.
+function leadershipNote(roster) {
+  const lines = roster.map((p) => {
+    const bits = [];
+    if (p.title) bits.push(p.title);
+    if (p.directPhone) bits.push(`direct ${p.directPhone}${p.directPhoneDNC ? ' (flagged Do Not Call — do not dial)' : ''}`);
+    if (p.mobilePhone) bits.push(`mobile ${p.mobilePhone}${p.mobilePhoneDNC ? ' (flagged Do Not Call — do not dial)' : ''}`);
+    if (p.email) bits.push(p.email);
+    if (p.linkedin) bits.push(p.linkedin);
+    if (p.primary) bits.push('the primary contact on this record');
+    const tail = [p.source ? `(${p.source})` : '', p.date ? `[${p.date}]` : ''].filter(Boolean).join(' ');
+    return `· ${p.name.toUpperCase()} — ${bits.join(' · ')}.${tail ? ' ' + tail : ''}`;
+  });
+  if (!lines.length) return '';
+  const withPhone = roster.filter((p) => p.directPhone || p.mobilePhone).length;
+  return `Everyone at the top of this company the research could name, with a phone number on ${withPhone} of ${roster.length}. Owners and C-level first.\n\n${lines.join('\n')}`;
+}
+
 // Findings first, icebreakers last. Any note the profile added beyond these keys is
 // written after the known ones, in the order it was given.
-const NOTE_ORDER = ['PAYROLL FINDINGS', 'COMPANY STRUCTURE', 'CONTACT', 'COMPANY BACKGROUND',
+const NOTE_ORDER = ['PAYROLL FINDINGS', 'COMPANY STRUCTURE', 'CONTACT', 'LEADERSHIP CONTACTS', 'COMPANY BACKGROUND',
   'RESEARCH', 'TIMING', 'COMPLIANCE', 'ICEBREAKERS'];
 
 function orderedNotes(notes) {
@@ -990,7 +1091,23 @@ async function writeLeadDirect(result, mode = 'full') {
   // Two situations fill these: someone displaced from the primary slot, and — the
   // case the user asked for — a reachable senior second when the decision-maker has
   // no direct phone or email. The owner stays primary either way.
-  const extras = Array.isArray(result.additionalContacts) ? result.additionalContacts.slice(0, 2) : [];
+  const roster = leadershipRoster(result);
+  const extras = (Array.isArray(result.additionalContacts) ? result.additionalContacts : [])
+    .filter((p) => p && filled(p.lastName)).slice(0, 2);
+  // Any slot the profile left empty is filled from the leadership roster: the most
+  // senior person, not already on the record, who has a phone number. Two named
+  // executives with direct dials on every record is the point of the roster.
+  if (extras.length < 2) {
+    const primaryKey = personName(result.contact || {}).toLowerCase();
+    const used = new Set([primaryKey, ...extras.map((p) => personName(p).toLowerCase())]);
+    for (const p of roster) {
+      if (extras.length >= 2) break;
+      if (used.has(p.name.toLowerCase()) || !(p.directPhone || p.mobilePhone)) continue;
+      used.add(p.name.toLowerCase());
+      extras.push({ firstName: p.firstName, lastName: p.lastName, title: p.title, email: p.email,
+        directPhone: p.directPhone || p.mobilePhone, functionalRole: p.functionalRole, reason: 'leadership roster' });
+    }
+  }
   extras.forEach((p, i) => {
     if (!p || !filled(p.lastName)) return;
     const b = ADDITIONAL_BLOCKS[i];
@@ -1049,6 +1166,12 @@ async function writeLeadDirect(result, mode = 'full') {
   // "no match" under it is exactly the output this whole pass exists to prevent,
   // and an absent note is itself the signal that nothing turned up.
   const notes = { ...(result.notes || {}) };
+
+  // The leadership roster is always written by the server from the structured list,
+  // never taken from a note the model wrote, so it reads identically on every model.
+  // Only worth a note when there is more than the primary on it.
+  if (roster.length > 1) notes['LEADERSHIP CONTACTS'] = leadershipNote(roster);
+  else delete notes['LEADERSHIP CONTACTS'];
 
   // If the profile found several entities but wrote no structure note, build one —
   // the breakdown behind a rolled-up headcount must be visible, or the number looks
@@ -1195,54 +1318,159 @@ function extractJSON(text) {
 
 /**
  * Run one headless Claude session. Prompt goes in over stdin so nothing has to
- * survive Windows shell quoting. Returns { ok, json, text, events, cost, turns }.
+ * survive shell quoting. Returns { ok, json, text, events, cost, turns, stopped }.
  */
 async function runClaude(prompt, opts = {}) {
   const waitedFrom = Date.now();
   await acquireSession();
   if (Date.now() - waitedFrom > 2000) opts.onEvent?.({ kind: 'note', msg: `Waited ${Math.round((Date.now() - waitedFrom) / 1000)}s for a free Claude slot.` });
-  try { return await runClaudeNow(prompt, opts); }
+  try {
+    // The run may have been stopped while this job was queued for a slot.
+    if (opts.cancelled && opts.cancelled()) return { ok: false, stopped: 'cancelled', error: `${opts.label || 'session'} was not started: the run was stopped`, events: [], toolCalls: 0, cost: null };
+    return await runClaudeNow(prompt, opts);
+  }
   finally { releaseSession(); }
 }
 
-function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd } = {}) {
+// `claudeCmd` is a program plus optional arguments ("claude", or "node stub.mjs" in
+// the tests). It is split here rather than handed to a shell: with `shell: true`
+// the process we held was /bin/sh, and killing it on a timeout left the real CLI
+// running as an orphan with its stdout pipe open. That orphan kept spending money
+// for hours, the 'close' event never fired, the job never finished and the server-
+// wide session slot was never released. That was the "circling for hours" bug.
+const parseCmd = (s) => String(s || 'claude').trim().match(/(?:[^\s"]+|"[^"]*")+/g).map((a) => a.replace(/^"|"$/g, ''));
+
+// Every live CLI process, keyed by a group tag (the run id), so a run can be stopped.
+const liveChildren = new Map();   // child -> { group, stop }
+function stopGroup(group, reason) {
+  let n = 0;
+  for (const [, v] of liveChildren) if (v.group === group) { v.stop(reason); n++; }
+  return n;
+}
+
+// Tools a research session has no business using. It reads nothing from disk any
+// more (the brief is inlined in the prompt) and it never runs code.
+const RESEARCH_DISALLOWED = 'Bash,Edit,Write,MultiEdit,NotebookEdit,Glob,Grep,Task,TodoWrite,KillShell,BashOutput,Read';
+
+// A session the server kills never sends its final result event, which is the only
+// place the CLI reports cost. Token usage arrives on every assistant message, so
+// it is summed as it goes and priced here when the real number never comes. These
+// are list prices per million tokens and are an ESTIMATE — good enough for the
+// stats page to stop under-counting stopped sessions, not an invoice.
+const PRICE_PER_MTOK = {
+  haiku:  { in: 1,  out: 5,  cacheRead: 0.1, cacheWrite: 1.25 },
+  sonnet: { in: 3,  out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  opus:   { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+};
+function estimateCost(model, u) {
+  const key = Object.keys(PRICE_PER_MTOK).find((k) => String(model || '').toLowerCase().includes(k)) || 'opus';
+  const p = PRICE_PER_MTOK[key];
+  return Math.round(((u.in * p.in) + (u.out * p.out) + (u.cacheRead * p.cacheRead) + (u.cacheWrite * p.cacheWrite)) / 1e6 * 1000) / 1000;
+}
+
+function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd, model, maxCost, maxToolCalls, schema, disallowed, group } = {}) {
   return new Promise((resolve) => {
-    const args = ['-p', '--output-format', 'stream-json', '--verbose',
+    const [cmd, ...cmdArgs] = parseCmd(config.claudeCmd);
+    const args = [...cmdArgs, '-p', '--output-format', 'stream-json', '--verbose',
       '--permission-mode', config.permissionMode];
-    if (config.model) args.push('--model', config.model);
+    const m = model === undefined ? config.model : model;
+    if (m) args.push('--model', m);
+    if (config.fallbackModel && m !== config.fallbackModel) args.push('--fallback-model', config.fallbackModel);
+    // The CLI's own dollar ceiling: the session ends with subtype error_max_budget_usd
+    // the moment it is crossed, whatever the model was in the middle of.
+    if (maxCost) args.push('--max-budget-usd', String(maxCost));
+    // Structured output: the CLI makes the model return the JSON through a typed
+    // tool, so every model hands back the same shape and nothing depends on how
+    // well it formats a fenced block.
+    if (schema) args.push('--json-schema', JSON.stringify(schema));
+    if (disallowed) args.push('--disallowed-tools', disallowed);
 
     // Sessions run inside the run's own empty folder, never the app folder, so
     // there is nothing in the working directory for a curious session to read.
-    const child = spawn(config.claudeCmd, args, {
-      shell: true,
-      cwd: cwd || RUNS,
-      env: { ...process.env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: '32000' },
-    });
+    // `detached` puts the CLI in its own process group so the whole tree —
+    // the CLI plus anything it spawned — can be killed in one call.
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        cwd: cwd || RUNS, detached: true, stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: '32000' },
+      });
+    } catch (err) {
+      return resolve({ ok: false, error: `Could not start "${config.claudeCmd}": ${err.message}`, events: [], toolCalls: 0 });
+    }
 
     let buf = '';
     let finalText = '';
-    let cost = null, turns = 0, toolCalls = 0;
+    let structured = null;
+    let subtype = null;
+    let cost = null, turns = 0, toolCalls = 0, costEstimated = false;
+    const usage = { in: 0, out: 0, cacheRead: 0, cacheWrite: 0 };
     const events = [];
     const log = logFile ? fs.createWriteStream(logFile, { flags: 'a' }) : null;
     let done = false;
+    let stopped = null;          // why the server ended the session, if it did
 
     const note = (msg, kind = 'note') => {
-      events.push({ kind, msg, at: Date.now() });
+      if (events.length < 600) events.push({ kind, msg, at: Date.now() });
       onEvent?.({ kind, msg });
       log?.write(`[${new Date().toISOString()}] ${kind}: ${msg}\n`);
     };
 
-    const timer = setTimeout(() => {
+    const killTree = (sig) => {
+      try { process.kill(-child.pid, sig); return; } catch {}
+      try { child.kill(sig); } catch {}
+    };
+
+    const finish = (code) => {
       if (done) return;
-      note('timed out — killing session');
-      try { child.kill(); } catch {}
-    }, (timeoutMin || config.perLeadTimeoutMin) * 60_000);
+      done = true;
+      clearTimeout(hardTimer); clearInterval(idleTimer); clearTimeout(forceTimer);
+      liveChildren.delete(child);
+      log?.end();
+      const json = structured || extractJSON(finalText);
+      const budgetHit = subtype === 'error_max_budget_usd';
+      if (cost == null && (usage.in || usage.out || usage.cacheRead)) { cost = estimateCost(m, usage); costEstimated = true; }
+      const ok = !stopped && !budgetHit && code === 0 && !!json;
+      resolve({
+        ok, code, json, text: finalText, events, cost, costEstimated, usage, turns, toolCalls, stopped: stopped || (budgetHit ? 'budget' : null),
+        error: ok ? null
+          : stopped ? `${label || 'session'} was stopped by the server: ${stopped}`
+          : budgetHit ? `${label || 'session'} hit its cost ceiling ($${maxCost}) before finishing`
+          : subtype && subtype !== 'success' ? `${label || 'session'} ended with ${subtype}`
+          : code !== 0 ? `${label || 'session'} exited with code ${code}`
+          : `${label || 'session'} finished but returned no parseable JSON`,
+      });
+    };
+
+    let forceTimer = null;
+    const stop = (reason) => {
+      if (done || stopped) return;
+      stopped = reason;
+      note(`stopping session — ${reason}`);
+      killTree('SIGTERM');
+      // Give it ten seconds to die politely, then SIGKILL the group, then stop
+      // waiting for it at all: the job must finish even if the process will not.
+      forceTimer = setTimeout(() => {
+        killTree('SIGKILL');
+        setTimeout(() => finish(null), 3000);
+      }, 10_000);
+    };
+    liveChildren.set(child, { group: group || null, stop });
+
+    const hardTimer = setTimeout(() => stop(`ran longer than ${timeoutMin || config.perLeadTimeoutMin} minutes`),
+      (timeoutMin || config.perLeadTimeoutMin) * 60_000);
+    // A session that has printed nothing for a while is hung — a stuck tool call,
+    // a dead connector, a network stall. It is killed rather than waited on.
+    let lastOutput = Date.now();
+    const idleMs = Math.max(2, Number(config.idleKillMin) || 6) * 60_000;
+    const idleTimer = setInterval(() => { if (Date.now() - lastOutput > idleMs) stop(`no output for ${Math.round(idleMs / 60_000)} minutes`); }, 15_000);
 
     child.stdin.on('error', () => {});
     child.stdin.write(prompt);
     child.stdin.end();
 
     child.stdout.on('data', (chunk) => {
+      lastOutput = Date.now();
       buf += chunk.toString();
       let nl;
       while ((nl = buf.indexOf('\n')) !== -1) {
@@ -1253,10 +1481,15 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd } = {})
         try { ev = JSON.parse(line); } catch { continue; }
         log?.write(line + '\n');
         if (ev.type === 'assistant' && ev.message?.content) {
+          const u = ev.message.usage;
+          if (u) { usage.in += u.input_tokens || 0; usage.out += u.output_tokens || 0; usage.cacheRead += u.cache_read_input_tokens || 0; usage.cacheWrite += u.cache_creation_input_tokens || 0; }
           for (const c of ev.message.content) {
             if (c.type === 'tool_use') {
               toolCalls++;
-              note(`${c.name}${c.input?.query ? ` — ${String(c.input.query).slice(0, 90)}` : ''}`, 'tool');
+              if (c.name !== 'StructuredOutput') note(`${c.name}${c.input?.query ? ` — ${String(c.input.query).slice(0, 90)}` : ''}`, 'tool');
+              // The wall behind the prompt's budget. The prompt says eighty; a
+              // session that blows through a hundred is not going to converge.
+              if (maxToolCalls && toolCalls > maxToolCalls) stop(`used more than ${maxToolCalls} tool calls`);
             } else if (c.type === 'text' && c.text.trim()) {
               note(c.text.trim().slice(0, 300), 'say');
             }
@@ -1264,25 +1497,31 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd } = {})
           turns++;
         } else if (ev.type === 'result') {
           finalText = ev.result || finalText;
+          if (ev.structured_output && typeof ev.structured_output === 'object') structured = ev.structured_output;
+          subtype = ev.subtype || null;
           cost = ev.total_cost_usd ?? cost;
         }
       }
     });
 
-    child.stderr.on('data', (c) => log?.write('STDERR ' + c.toString()));
+    child.stderr.on('data', (c) => { lastOutput = Date.now(); log?.write('STDERR ' + c.toString()); });
 
     child.on('error', (err) => {
-      if (done) return; done = true; clearTimeout(timer); log?.end();
+      if (done) return;
+      stopped = null;
+      done = true; clearTimeout(hardTimer); clearInterval(idleTimer); clearTimeout(forceTimer); liveChildren.delete(child); log?.end();
       resolve({ ok: false, error: `Could not start "${config.claudeCmd}": ${err.message}`, events, toolCalls });
     });
 
-    child.on('close', (code) => {
-      if (done) return; done = true; clearTimeout(timer); log?.end();
-      const json = extractJSON(finalText);
-      resolve({
-        ok: code === 0, code, json, text: finalText, events, cost, turns, toolCalls,
-        error: code === 0 ? null : `${label || 'session'} exited with code ${code}`,
-      });
+    // 'exit' rather than 'close': close waits for every stdio pipe to drain, and an
+    // orphaned grandchild holding the pipe open is exactly the failure this guards.
+    // The last stdout lines (the result event) can land just after exit, so finish
+    // when stdout ends or two seconds after exit, whichever comes first.
+    let exitCode = null, exited = false, outEnded = false;
+    child.stdout.on('end', () => { outEnded = true; if (exited) finish(exitCode); });
+    child.on('exit', (code) => {
+      exited = true; exitCode = code;
+      if (outEnded) finish(code); else setTimeout(() => finish(code), 2000);
     });
   });
 }
@@ -1297,6 +1536,87 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd } = {})
 const SKILL_DIR = path.join(HERE, 'skill', 'zoho-lead-profiler');
 const skillPath = (...parts) => path.join(SKILL_DIR, ...parts);
 
+// The headless brief: the four skill files condensed into one, inlined into the
+// prompt so a session reads nothing from disk. ~9k tokens instead of the ~32k the
+// four files cost, and it is present from the first turn, so no Read calls, no
+// hunting, and no chance of a stale copy. The style section is shared verbatim by
+// both modes — that is what makes a basic and a comprehensive note read alike, and
+// what makes Sonnet, Opus and Fable write alike.
+const PROFILE_BRIEF = (() => { try { return fs.readFileSync(skillPath('HEADLESS.md'), 'utf8'); } catch { return ''; } })();
+const STYLE_SECTION = (() => {
+  const i = PROFILE_BRIEF.indexOf('## How everything is written');
+  const j = PROFILE_BRIEF.indexOf('## The notes');
+  return i >= 0 && j > i ? PROFILE_BRIEF.slice(i, j).trim() : '';
+})();
+
+// MCP tool names as the desktop logs showed them. Preflight can overwrite these
+// with what the server's CLI actually exposes (see PREFLIGHT_PROMPT), and every
+// prompt is rewritten through toolName() so a renamed connector costs zero turns.
+const DEFAULT_TOOL_PREFIX = { zoominfo: 'mcp__claude_ai_ZoomInfo__', zoho: 'mcp__claude_ai_Zoho_CRM__' };
+function toolPrefixes() {
+  const t = (state.preflight && state.preflight.toolPrefixes) || {};
+  return { zoominfo: t.zoominfo || DEFAULT_TOOL_PREFIX.zoominfo, zoho: t.zoho || DEFAULT_TOOL_PREFIX.zoho };
+}
+function applyToolNames(text) {
+  const p = toolPrefixes();
+  return String(text).split(DEFAULT_TOOL_PREFIX.zoominfo).join(p.zoominfo).split(DEFAULT_TOOL_PREFIX.zoho).join(p.zoho);
+}
+
+// The output contracts. Loose on purpose (additionalProperties stays open, almost
+// nothing is required) — the schema exists to force the shape and the types, and
+// the server's normalizer does the rest. A strict schema on a weaker model produces
+// refusals, not better JSON.
+const PERSON = {
+  type: 'object',
+  properties: {
+    firstName: { type: 'string' }, lastName: { type: 'string' }, title: { type: 'string' },
+    functionalRole: { type: 'string' }, email: { type: 'string' }, emailVerified: { type: 'boolean' },
+    directPhone: { type: 'string' }, directPhoneVerified: { type: 'boolean' }, directPhoneDNC: { type: 'boolean' },
+    mobilePhone: { type: 'string' }, mobilePhoneVerified: { type: 'boolean' }, mobilePhoneDNC: { type: 'boolean' },
+    linkedin: { type: 'string' }, source: { type: 'string' }, date: { type: 'string' }, reason: { type: 'string' },
+  },
+};
+const PROFILE_SCHEMA = {
+  type: 'object',
+  properties: {
+    leadId: { type: 'string' }, company: { type: 'string' },
+    disqualified: { type: ['string', 'null'] },
+    employees: { type: ['number', 'null'] }, employeesBasis: { type: 'string', enum: ['stated', 'estimate'] },
+    contactChanged: { type: 'boolean' },
+    contact: { ...PERSON, properties: { ...PERSON.properties, priority: { type: ['number', 'null'] }, employmentVerifiedBy: { type: 'string' }, replacesRecordContact: { type: 'boolean' }, reachable: { type: 'boolean' } } },
+    leadership: { type: 'array', items: PERSON },
+    additionalContacts: { type: 'array', items: PERSON },
+    entities: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, ein: { type: 'string' }, state: { type: 'string' }, role: { type: 'string' }, employees: { type: ['number', 'null'] }, source: { type: 'string' }, date: { type: 'string' } } } },
+    fields: { type: 'object', additionalProperties: { type: ['string', 'number', 'boolean', 'null'] } },
+    notes: { type: 'object', additionalProperties: { type: 'string' } },
+    needsHuman: { type: ['string', 'null'] },
+    coverage: { type: 'object', additionalProperties: { type: 'boolean' } },
+  },
+  required: ['leadId', 'contact', 'fields', 'notes'],
+};
+const BASIC_SCHEMA = {
+  type: 'object',
+  properties: {
+    leadId: { type: 'string' }, company: { type: 'string' },
+    basic: { type: 'object', properties: {
+      companyType: { type: 'string' }, ownership: { type: 'string' }, ceo: { type: 'string' },
+      employees: { type: ['number', 'null'] }, employeesBasis: { type: 'string' },
+      officeStaff: { type: ['number', 'null'] }, fieldStaff: { type: ['number', 'null'] }, facilities: { type: ['number', 'null'] },
+      hcm: { type: 'string' }, hcmEvidence: { type: 'string' }, hq: { type: 'string' }, execLocation: { type: 'string' },
+      gaps: { type: 'array', items: { type: 'string' } },
+    } },
+    employees: { type: ['number', 'null'] }, employeesBasis: { type: 'string' },
+    contactChanged: { type: 'boolean' },
+    contact: { ...PERSON, properties: { ...PERSON.properties, employmentVerifiedBy: { type: 'string' }, replacesRecordContact: { type: 'boolean' } } },
+    leadership: { type: 'array', items: PERSON },
+    additionalContacts: { type: 'array', items: PERSON },
+    fields: { type: 'object', additionalProperties: { type: ['string', 'number', 'boolean', 'null'] } },
+    notes: { type: 'object', additionalProperties: { type: 'string' } },
+    needsHuman: { type: ['string', 'null'] },
+  },
+  required: ['leadId', 'basic', 'contact', 'fields', 'notes'],
+};
+
 const SKILL_LINE =
   'Use the zoho-lead-profiler skill. ' +
   'Follow its rules exactly, including its verification ladder, search recipes, and its rule that no claim is written without a source and a date.';
@@ -1309,18 +1629,26 @@ const SKILL_FILES_BLOCK =
 - ${skillPath('references', 'zoho-writeback.md')} — read before preparing the notes
 Do NOT search for skill files — no Glob, no Grep, no find, no directory listings, no unzipping anything. Any other copy of this skill on this machine is stale and carries retired rules (including a scoring rubric this skill no longer has); never read one. Do not read anything else in the working directory either — no README, no logs, no prior results.`;
 
-const PREFLIGHT_PROMPT = `You are running a one-shot capability check for a local dashboard. Do not do any research.
+const PREFLIGHT_PROMPT = `You are running a one-shot capability check for a dashboard. Do not do any research.
 
-Check, in order:
-1. Whether the "zoho-lead-profiler" skill is available to you. List its name if you can see it.
-2. Whether Zoho CRM MCP tools are available (tools named mcp__Zoho_CRM__*). If they are, make exactly ONE cheap call: mcp__Zoho_CRM__getModuleByApiName for module "Leads", and report whether it succeeded.
-3. Whether ZoomInfo MCP tools are available (mcp__ZoomInfo__*). Do NOT call them — just report presence.
-4. Whether WebSearch is available. Do not call it.
+Do exactly this, in one or two messages:
+1. Call ToolSearch twice, in one message: once with the query "zoominfo" and once with the query "zoho". Read the EXACT full tool names that come back (they look like mcp__<server>__<tool>).
+2. From those names, work out the prefix for the ZoomInfo tools (everything up to and including the second "__", e.g. "mcp__claude_ai_ZoomInfo__") and the prefix for the Zoho CRM tools. If a family is absent, use null.
+3. Do not call any Zoho or ZoomInfo tool. Do not call WebSearch. Report whether WebSearch and WebFetch are in your tool list.
 
-Then output ONLY a fenced json block, no prose:
+Output ONLY a fenced json block, no prose:
 \`\`\`json
-{"skill": true, "zoho": true, "zohoLeadsReachable": true, "zoominfo": true, "websearch": true, "notes": "one short line on anything missing"}
+{"zoho": true, "zoominfo": true, "websearch": true, "webfetch": true, "toolPrefixes": {"zoominfo": "mcp__claude_ai_ZoomInfo__", "zoho": "mcp__claude_ai_Zoho_CRM__"}, "zoominfoTools": ["enrich_contacts", "search_contacts_v2"], "notes": "one short line on anything missing"}
 \`\`\``;
+const PREFLIGHT_SCHEMA = {
+  type: 'object',
+  properties: {
+    zoho: { type: 'boolean' }, zoominfo: { type: 'boolean' }, websearch: { type: 'boolean' }, webfetch: { type: 'boolean' },
+    toolPrefixes: { type: 'object', properties: { zoominfo: { type: ['string', 'null'] }, zoho: { type: ['string', 'null'] } } },
+    zoominfoTools: { type: 'array', items: { type: 'string' } }, notes: { type: 'string' },
+  },
+  required: ['zoho', 'zoominfo', 'websearch'],
+};
 
 function fetchPrompt(seg) {
   return `You are fetching a candidate list for a human to choose from. Do NOT profile anything, do NOT research, do NOT write to Zoho. This is a read-only listing task.
@@ -1346,110 +1674,71 @@ Output ONLY a fenced json block, no prose:
 \`\`\``;
 }
 
-function profilePrompt(lead, pepm) {
-  return `${SKILL_LINE}
-
-${SKILL_FILES_BLOCK}
-
-You are profiling ONE lead, already explicitly chosen by the user. Skip Step 1 of the skill entirely — the selection is done. Do NOT choose or add any other lead.
-
-Lead — this is the complete relevant extract of the Zoho record, current as of this run. Do NOT call getRecord and do NOT re-read this lead from Zoho; start from what is below:
-- Zoho record id: ${lead.id}
+// The lead extract every mode gets. Everything the picker already pulled from Zoho
+// goes in, so a session never spends a call re-reading the record.
+function leadBlock(lead) {
+  return `- Zoho record id: ${lead.id}
 - Company: ${lead.company}
 - On record: ${lead.contact || '(none)'} ${lead.title ? `— ${lead.title}` : ''}
 - Location: ${[lead.city, lead.state].filter(Boolean).join(', ') || '(unknown)'}
-- Industry: ${lead.industry || '(unknown)'}
+- Industry on record: ${lead.industry || '(unknown)'}
 - Website: ${lead.website || '(none on record)'}
-- Email on record: ${lead.email || '(none)'}
-- Phone on record: ${lead.phone || '(none)'} · Mobile on record: ${lead.mobile || '(none)'}
+- Email on record: ${lead.email || '(none)'} · Phone on record: ${lead.phone || '(none)'} · Mobile on record: ${lead.mobile || '(none)'}
 - Employee count on record (ZoomInfo import, unverified): ${lead.employees ?? '(none)'}
-- Lead owner: ${(lead.owner && lead.owner.name) || '(unknown)'}
+- Lead owner: ${(lead.owner && lead.owner.name) || '(unknown)'}`;
+}
 
-The client's PEPM for deal sizing is $${pepm} per employee per month. Do not ask for it.
+// The output shape, described once for the model in words the rulebook uses. The
+// CLI's structured output enforces the types; this says what each thing means.
+const PROFILE_SHAPE = `{
+  "leadId": "<the Zoho record id, unchanged>", "company": "<company name>",
+  "disqualified": null | "<why, in one sentence>",
+  "employees": <total across every legal entity, or null>, "employeesBasis": "stated" | "estimate",
+  "contactChanged": <true when the primary is not the person who was on the record>,
+  "contact": { "firstName", "lastName", "title", "priority": 1 | 2 | null, "email", "emailVerified", "directPhone", "directPhoneVerified", "directPhoneDNC", "mobilePhone", "mobilePhoneVerified", "mobilePhoneDNC", "linkedin", "employmentVerifiedBy": "<source + date in words>", "replacesRecordContact", "reachable" },
+  "leadership": [ { "firstName", "lastName", "title", "functionalRole", "email", "directPhone", "directPhoneDNC", "mobilePhone", "mobilePhoneDNC", "linkedin", "source": "<where the numbers came from>", "date": "<US date>" } ],
+  "additionalContacts": [ { "firstName", "lastName", "title", "functionalRole", "email", "directPhone", "reason": "displaced" | "owner unreachable" } ],
+  "entities": [ { "name", "ein", "state", "role": "operating | office | field staff | staffing arm | per-state entity | parent | subsidiary", "employees", "source", "date" } ],
+  "fields": { "Website", "Street", "City", "State", "Zip_Code", "Company_Number", "Employee_Count", "Company_Size", "Employee_Growth", "Number_of_Locations", "Description", "Existing_Client", "Certified_Active_Company", "Certification_Date", "Current_PR_Provider_new", "Current_Payroll_Service", "Payroll_Frequency", "HCM", "HRM", "Benefits_Administration_Software", "Benefits_Carrier", "Healthcare_Providers", "Employee_Benefits_Broker", "K_Retirement_Plan", "WC_Carrier", "WC_Renewal_Date", "BN_Renewal_Date", "LinkedIn_Company_Profile_URL", "Facebook_Company_Profile_URL", "Email_Domain", "Entity_Name_Ultimate_Parent" },
+  "notes": { "PAYROLL FINDINGS", "COMPANY STRUCTURE", "CONTACT", "COMPANY BACKGROUND", "TIMING", "COMPLIANCE", "ICEBREAKERS", "<any other plainly-titled note>" },
+  "needsHuman": null | "<one sentence on what a person must decide>",
+  "coverage": { "directPhone", "email", "provider", "headcount", "socialIcebreaker", "publicRecord", "leadershipPhones" }
+}`;
 
-Do Steps 2 through 5 of the skill: verify the contact and confirm they are the top decision-maker (priority 1 or 2), research the company per references/search-recipes.md, write the Description bullets, and build the icebreakers.
+const FIELD_RULES = `- "leadership" is REQUIRED and is where the phone-number effort goes: every owner, partner, founder and C-level person you could name, with every direct dial, mobile and email you could establish and where each came from. Include the primary too. Order: owners, then CEO/President, then CFO/COO/other chiefs. The dashboard writes this list to the record as its own note and fills the two additional-contact slots from it.
+- "contact" is the primary — the top decision-maker per the rulebook. Keep the record's person if they are priority 1 or 2; otherwise the owner or CEO goes here with "replacesRecordContact": true and "contactChanged": true, and the record's person goes in "additionalContacts" with reason "displaced". A missing phone never demotes the owner.
+- "fields" keys are real Zoho API names and are written straight through. Omit any key you have no value for — never send "" to hold a place. "Payroll_Frequency" is one of Bi-weekly, Monthly, Semi-Monthly, Weekly, Quarterly. "Benefits_Carrier" is one of Aetna, Anthem, BCBS, Cigna, United — any other carrier goes in "Healthcare_Providers". "Existing_Client" is Yes or No. "Certification_Date", "WC_Renewal_Date" and "BN_Renewal_Date" take ISO YYYY-MM-DD. "functionalRole" on any person is one of: CEO, Partner - Owner, President, CFO, Controller, Head of Finance, COO, Head of HR, HR Admin, HR Manager, Office Manager, Marketing, Payroll, Board Member, Sales Person, Unknown — keep the real title in "title".
+- "Description" is MANDATORY: one plain sentence saying what the company is, then up to six bullets. Never return a profile without it.
+- "Employee_Count" is the TOTAL across every entity in "entities", never one entity's figure.
+- "coverage" is a plain true/false record of what you managed to find, for the dashboard's stats. It is not a rating.
+- "needsHuman" is null unless something genuinely needs a person: an ambiguous name match, an unproven company identity, or a value you would be overriding without solid evidence.`;
 
-DO NOT SCORE THIS LEAD. No fit score, no tier, no temperature, no confidence rating, no priority grade, no estimated deal value. The user has said plainly they do not want leads rated. Report what you found — the facts, their sources and their dates — and let the rep judge. "verified" and "unverified" on a specific phone or email are check outcomes, not scores, and those stay.
+function profilePrompt(lead, opts = {}) {
+  const budget = 80;
+  const wall = Number(opts.maxToolCalls) || config.maxToolCallsFull;
+  return applyToolNames(`You are profiling ONE lead for a payroll sales team, headless, inside a dashboard. The complete rulebook is at the end of this message under RULEBOOK — follow it exactly. You never write to Zoho: a human reviews the JSON you return and the dashboard writes it. Read-only Zoho calls are fine.
 
-CRITICAL — do NOT write anything to Zoho. No createRecords, no updateRecord, no note creation, no Profiled_Date stamp. A human reviews these results in a dashboard first and the write happens separately. Read-only Zoho calls are fine.
+LEAD — this is the complete relevant extract of the Zoho record, current as of this run. Do NOT call getRecord and do NOT re-read this lead from Zoho; start from what is below:
+${leadBlock(lead)}
+
+THE JOB: verify the contact and settle who the top decision-maker is; build the leadership roster with phone numbers; research the company through the four rounds; write the Description, the notes and the icebreakers. No scoring of any kind — no fit score, tier, temperature, confidence rating or deal value. Report facts, sources and dates and let the rep judge.
 
 WORK EFFICIENTLY — these rules cut cost, never depth:
-- Start with ONE ToolSearch call that loads every tool you will need at once: "select:WebSearch,WebFetch,mcp__claude_ai_Zoho_CRM__searchRecords,mcp__claude_ai_ZoomInfo__enrich_contacts,mcp__claude_ai_ZoomInfo__search_contacts_v2,mcp__claude_ai_ZoomInfo__search_scoops,mcp__claude_ai_ZoomInfo__enrich_intent". Never load tools one at a time.
-- Fire each research round as ONE message containing ALL of that round's tool calls in parallel — the skill's four rounds are designed for exactly this. Never issue calls one at a time when they do not depend on each other's results.
-- Write NO commentary between tool calls — no narration of what you are about to do, no summaries of what came back. Every extra turn re-reads the entire conversation and is the main cost of this run. Hold everything for the final JSON.
+- Start with ONE ToolSearch call that loads every tool you will need at once: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_contacts,mcp__claude_ai_ZoomInfo__search_contacts_v2,mcp__claude_ai_ZoomInfo__search_scoops,mcp__claude_ai_ZoomInfo__enrich_intent,mcp__claude_ai_Zoho_CRM__searchRecords". Never load tools one at a time. Do not read any file, run any command or list any directory — everything you need is in this message.
+- Fire each research round as ONE message containing ALL of that round's tool calls in parallel. Never issue calls one at a time when they do not depend on each other's results.
+- Write NO commentary between tool calls — no narration, no summaries of what came back. Every extra turn re-reads the whole conversation and is the main cost of this run. Hold everything for the final JSON.
+- A met completion-bar item never earns another call. When the bar is met, return the JSON immediately.
 
-Dig properly. Your budget is EIGHTY tool calls for this lead and it is a ceiling, not a target — there is no stop-early rule. Work the completion bar in references/search-recipes.md before you finish: a verified decision-maker with a current title, a reachable direct or mobile phone somewhere on the record, a defensible email, a sourced headcount, a provider hypothesis or all five detection routes attempted, the public-record sweep, the mandatory social sweep, three or more icebreakers with at least one from the person's own social account, and the Description bullets. When a search comes back empty, work its escalation ladder before recording a gap.
+BUDGET: ${budget} tool calls is the ceiling, not a target — most leads need a real fraction of it. The server hard-stops this session at ${wall} tool calls, at $${config.maxCostFull} of spend, and at ${config.perLeadTimeoutMin} minutes, and a stopped session returns NOTHING — so at call ${budget - 10}, or whenever the ladders you still have open are unlikely to change the record, stop researching and return the JSON you have. A complete JSON with a gap beats a killed session.
 
-If the decision-maker has no direct dial and no mobile, or no email you can stand behind, KEEP THEM as the primary contact and additionally find the most senior person at the company who does have a direct phone and an email. Put that person in "additionalContacts". Anyone displaced from the primary slot who is still at the company goes there too. Never substitute a more reachable person into the primary slot.
-
-When done, output ONLY a fenced json block as your entire final message — no prose before or after. Prepare the note bodies exactly as you would write them to Zoho, using the format in references/zoho-writeback.md; the dashboard writes them on approval. Omit any note that would be empty.
-
-\`\`\`json
-{
-  "leadId": "${lead.id}",
-  "company": "${lead.company}",
-  "disqualified": null,
-  "employees": null,
-  "employeesBasis": "estimate",
-  "contactChanged": false,
-  "contact": {
-    "firstName": "", "lastName": "", "title": "",
-    "priority": 1,
-    "email": "", "emailVerified": false,
-    "directPhone": "", "directPhoneVerified": false, "directPhoneDNC": false,
-    "mobilePhone": "", "mobilePhoneVerified": false, "mobilePhoneDNC": false,
-    "linkedin": "",
-    "employmentVerifiedBy": "source + date",
-    "replacesRecordContact": false,
-    "reachable": true
-  },
-  "entities": [
-    { "name": "", "ein": "", "state": "", "role": "operating | office | field staff | staffing arm | per-state entity | parent | subsidiary", "employees": null, "source": "", "date": "" }
-  ],
-  "additionalContacts": [
-    { "firstName": "", "lastName": "", "title": "", "functionalRole": "", "email": "", "directPhone": "", "reason": "displaced | owner unreachable" }
-  ],
-  "fields": {
-    "Website": "", "Street": "", "City": "", "State": "", "Zip_Code": "", "Company_Number": "",
-    "Employee_Count": null, "Company_Size": null, "Employee_Growth": null, "Number_of_Locations": "",
-    "Description": "", "Existing_Client": "", "Certified_Active_Company": null, "Certification_Date": "",
-    "Current_PR_Provider_new": "", "Current_Payroll_Service": "", "Payroll_Frequency": "",
-    "HCM": "", "HRM": "", "Benefits_Administration_Software": "", "Benefits_Carrier": "",
-    "Healthcare_Providers": "", "Employee_Benefits_Broker": "", "K_Retirement_Plan": "",
-    "WC_Carrier": "", "WC_Renewal_Date": "", "BN_Renewal_Date": "",
-    "LinkedIn_Company_Profile_URL": "", "Facebook_Company_Profile_URL": "", "Email_Domain": ""
-  },
-  "notes": {
-    "PAYROLL FINDINGS": "", "COMPANY STRUCTURE": "", "CONTACT": "", "COMPANY BACKGROUND": "",
-    "TIMING": "", "COMPLIANCE": "", "ICEBREAKERS": ""
-  },
-  "needsHuman": null,
-  "coverage": { "directPhone": false, "email": false, "provider": false, "headcount": false, "socialIcebreaker": false, "publicRecord": false }
-}
-\`\`\`
+OUTPUT: your final answer is the JSON object below and nothing else (the structured output). Every note body is written exactly as it should appear in Zoho, per the rulebook's style rules. Omit any note that would be empty.
+${PROFILE_SHAPE}
 
 Field rules:
-- "employeesBasis" is one of: stated, estimate.
-- Date-type fields inside "fields" — Certification_Date, WC_Renewal_Date, BN_Renewal_Date — take ISO format YYYY-MM-DD (e.g. 2026-09-03). The US date rule (8/19/2026) applies to text in notes and the Description, never to these three fields; a US-format value here makes Zoho reject the whole record.
-- "fields" keys are real Zoho API names on this org and the dashboard writes them straight through. Omit any key you have no value for — do not send an empty string to hold a place. Never add "Annual_Revenue", "No_of_Employees", "Secondary_Email", "Fax", "Twitter" or "Country": they do not exist here and they fail the whole record.
-- "Description" is MANDATORY. Never return a profile without it. Open with ONE plain sentence saying what the company is — "Achieve Behavioral Therapy provides in-home and school-based therapy for children with autism, across six states." — then up to six bullets, one to two lines each. Never restate anything already in another field (headcount, city, state, website, provider). No sources, dates or links in the Description; they belong in the notes. Revenue may appear once, with its source, because this org has no revenue field.
-- PLAIN ENGLISH IN EVERY FIELD AND EVERY NOTE. This is the feedback that keeps coming back, so treat it as a hard requirement. No source codes and no shorthand — never "LI 12Jul26", "FB", "ATS", "5500", "SchC", "SOS", "DOL WHD", "ZI accuracy 91", "NPI 1780029322", "taxonomy 103K00000X", "PEPM", "SUI", "W-2", "priority 1", "14Jul26". Write instead "on LinkedIn on 12 July 2026", "on their Facebook page", "their online job-application system", "their federal retirement-plan filing for 2024, which employers file each year", "the state business registry", "a US Department of Labor wage investigation", "ZoomInfo, last checked June 2026", "their federal healthcare provider registration, the public record that names the legal owner", "employees on payroll rather than contractors", "state unemployment insurance and payroll tax accounts". Dates always written out in full. Name sources in words inside the sentence, with the link after it.
-- FIND EVERY LEGAL ENTITY, AND MAKE THE HEADCOUNT THE TOTAL ACROSS ALL OF THEM. Many of these companies are not one company. It is common to run one entity for the office and a separate one for field staff, or a separate entity per state, or a staffing arm alongside the operating business — each with its own federal employer ID number (EIN), each running its own payroll. ZoomInfo almost always reports only the headquarters shell: on a recent lead it said 8 employees while the company itself said 100-plus clinicians across four entities. Search deliberately for related entities — the state business registry for other companies at the same address or under the same officer, federal retirement-plan and nonprofit filings which list the EIN and participant counts per entity, industry licence registries, "doing business as" names, and near-identical company names with a state or a suffix attached. Put every entity you find in "entities" with its own headcount, and set "Employee_Count" to the SUM across all of them, never one entity's figure. If you cannot get a headcount for one entity, still list it and say so — a total that is a floor is honest and useful; a headquarters-only number is misleading.
-- WRITE THE STRUCTURE UP in the "COMPANY STRUCTURE" note: one line per entity with its name, state, what it does, its headcount and its EIN if you found one, then the total. Say plainly why it matters — each separate employer ID is its own payroll registration, its own tax filings and its own set of W-2s, and companies running several often have payroll split across systems or people.
-- EVERY POINT STARTS WITH A SHORT HEADLINE, THEN AN EM DASH, THEN THE DETAIL. The headline is a 2-8 word summary of the point in plain capitals, written in ordinary letters — the dashboard converts it to bold characters before writing, so do not try to bold it yourself and do not use asterisks, <b> tags or markdown anywhere. Zoho notes are plain text and any markup you write will show up literally as angle brackets and asterisks. Shape every bullet exactly like this, with the em dash separating headline from detail:
-  "· ONE PERSON RUNS HR AND CLINICAL — Aurelie Benittah, the Operations Manager, covers both. One person carrying HR for a part-time, multi-state workforce is the clearest sign they have outgrown what they are using. (their team page) [8/18/2026]"
-  Keep section headings as short lines in plain capitals on their own line; those get bolded too. Do not put a source, a date or a full sentence inside the headline — the headline is the summary, everything else goes after the dash.
-- DATES AND SOURCES GO AT THE END OF THE LINE, IN BRACKETS. Dates are US numeric with no leading zeros — 8/19/2026, never "19 August 2026", never "14Jul26", never "2026-08-19". A month with no day is 8/2026. Put the SOURCE in round brackets and the DATE in square brackets, in that order, at the very end: "They now run offices in six states, so each one needs its own payroll tax account and unemployment insurance rate. (company website) [8/18/2026]". Never bury a date or a source mid-sentence. This applies to the notes and to the Description.
-- EXPLAIN EVERY FINDING. Each item says three things in plain sentences — what you found, where it came from, and WHY IT MATTERS FOR PAYROLL. A fact with a source and no consequence is half a finding and is the most common complaint about this output. Give any technical term half a sentence of explanation the first time it appears. Keep it short, but understandable comes before short.
-- "PAYROLL FINDINGS" is the most important note on the record and comes first. Everything bearing on how these people get paid goes here, most payroll-relevant first — how the workforce is shaped and what that does to payroll, who runs payroll and HR today and how thin that is, the provider and what makes you think so, retirement plan and benefits and workers comp and any renewal dates, open roles that reveal pain, and anything else with a payroll consequence such as new state registrations or rapid hiring.
-- "ICEBREAKERS" IS OPENERS ONLY. Do not put research in it. A retirement plan, a state registration, an HR department of one, a benefits renewal date — all of those are payroll findings and belong in "PAYROLL FINDINGS". The last run put three such items in the icebreakers and it made the note unusable. The test is whether a rep could say the line out loud to a stranger in the first minute of a call. When something is genuinely both, put the detail in the findings note and one line in the icebreakers.
-- Zoho accepts unlimited notes. Add extra plainly-titled notes when a topic earns one — "BENEFITS AND RETIREMENT", "OPEN ROLES", "LOCATIONS". Any key you add to "notes" is written as its own note.
-- "Payroll_Frequency" must be one of: Bi-weekly, Monthly, Semi-Monthly, Weekly, Quarterly. "Benefits_Carrier" must be one of: Aetna, Anthem, BCBS, Cigna, United — any other carrier goes in "Healthcare_Providers". "Existing_Client" is Yes or No. Anything outside these is dropped before writing.
-- "functionalRole" on an additional contact must be one of: CEO, Partner - Owner, President, CFO, Controller, Head of Finance, COO, Head of HR, HR Admin, HR Manager, Office Manager, Marketing, Payroll, Board Member, Sales Person, Unknown. Keep the person's real title in "title".
-- NEVER write an absence anywhere — not in a field, not in a note, not in a bullet. No "no match", "not found", "none", "N/A", "unknown", "no violations", "clean". A field you could not establish is simply omitted, and a note with nothing real in it is omitted too. The dashboard strips these before writing, so anything you include here is wasted work.
-- "COMPLIANCE" is written ONLY when an enforcement action, tax warrant or adverse filing actually surfaced. "TIMING" only when a dated, timely event surfaced. Leave them empty otherwise.
-- "coverage" is a plain true/false record of what you managed to find, used only for the dashboard's own stats. It is not a rating of the lead.
-- "needsHuman" is null unless something genuinely needs a person: an ambiguous name match, an unproven company identity, or a value you would be overriding without solid evidence.`;
+${FIELD_RULES}
+
+RULEBOOK
+${PROFILE_BRIEF}`);
 }
 
 function writePrompt(result, pepm, mode = 'full') {
@@ -1490,98 +1779,62 @@ Output ONLY a fenced json block:
 Each entry in "overrides" is {"field": "", "was": "", "now": ""}.`;
 }
 
-// The BASIC profile. Six facts, one lookup method each, no skill files, no
-// escalation ladders. It exists because the comprehensive pass is the right tool
-// for a lead a rep is about to call and the wrong tool for sizing up two hundred
-// leads at once. The whole point is the cost ceiling, so the prompt is
-// self-contained: nothing is read from disk and the tool budget is a hard stop.
-function basicPrompt(lead) {
-  return `You are doing a BASIC PROFILE of one company for a payroll sales team. This is a light pass, not research. Six facts, one lookup method each, then stop.
-
-Company — this is the Zoho lead record, current as of this run. Do NOT re-read it from Zoho:
-- Zoho record id: ${lead.id}
-- Company: ${lead.company}
-- On record: ${lead.contact || '(none)'} ${lead.title ? `— ${lead.title}` : ''}
-- Location: ${[lead.city, lead.state].filter(Boolean).join(', ') || '(unknown)'}
-- Industry on record: ${lead.industry || '(unknown)'}
-- Website: ${lead.website || '(none on record)'}
-- Email on record: ${lead.email || '(none)'} · Phone on record: ${lead.phone || '(none)'} · Mobile: ${lead.mobile || '(none)'}
-- Employee count on record (ZoomInfo import, unverified): ${lead.employees ?? '(none)'}
+// The BASIC profile. Six facts, one lookup method each, no escalation ladders.
+// It exists because the comprehensive pass is the right tool for a lead a rep is
+// about to call and the wrong tool for sizing up two hundred leads at once — and,
+// since this version, it is also the FALLBACK when a comprehensive session is
+// stopped or fails, so a lead never comes back with nothing. The style section is
+// the same text the comprehensive prompt carries, so the note reads the same.
+function basicPrompt(lead, opts = {}) {
+  const wall = Number(opts.maxToolCalls) || config.maxToolCallsBasic;
+  const why = opts.fallbackReason ? `\nThis is a FALLBACK: the full research pass on this lead was stopped (${opts.fallbackReason}). Do the light pass properly and return it — this is what the rep will get.\n` : '';
+  return applyToolNames(`You are doing a BASIC PROFILE of one company for a payroll sales team, headless, inside a dashboard. This is a light pass, not research: six facts, one lookup method each, then stop. You never write to Zoho; a human reviews the JSON first.
+${why}
+COMPANY — this is the Zoho lead record, current as of this run. Do NOT re-read it from Zoho:
+${leadBlock(lead)}
 
 THE SIX FACTS AND THE ONE WAY TO GET EACH:
 1. WHAT THEY ARE — nursing home, home care agency, manufacturer, charter school, etc. Method: the company website home page (WebFetch). No website on record: ONE WebSearch for "${lead.company}" ${lead.state || ''} and use the first result that is clearly them.
-2. OWNERSHIP AND CEO — who owns it (a single owner, partners, a family, a private-equity group, a public company, a nonprofit board) and who the CEO or top person is. Method: ONE ZoomInfo contact search on the company for owners and C-level people (mcp__claude_ai_ZoomInfo__search_contacts_v2 with management level owner/C-level, up to 10 rows). If the website has an about or leadership page and you already fetched the site, read the names off that too, but do not go looking for more.
+2. OWNERSHIP AND THE LEADERSHIP ROSTER — who owns it (a single owner, partners, a family, a private-equity group, a public company, a nonprofit board) and every owner and C-level person you can name: CEO, President, CFO, COO, other chiefs. Method: ONE ZoomInfo contact search on the company (mcp__claude_ai_ZoomInfo__search_contacts_v2 with managementLevelList ["Owner", "C Level Exec"], up to 10 rows). If the website has an about or leadership page and you already fetched the site, read the names off that too, but do not go looking for more.
 3. EMPLOYEE COUNT — Method: ONE ZoomInfo company enrichment (mcp__claude_ai_ZoomInfo__enrich_companies) for the headline count. Two special cases:
    - HOME CARE / HOME HEALTH / STAFFING: the ZoomInfo number is usually the office and the real workforce is in the field. Do ONE extra WebSearch: "${lead.company}" caregivers OR aides OR nurses OR employees — and if the company or a news item states a field-staff figure, report office and field separately.
    - NURSING HOME / ASSISTED LIVING / ANY MULTI-FACILITY GROUP: count the whole group. Do ONE extra WebSearch: "${lead.company}" facilities OR locations OR "skilled nursing" — and report the number of facilities and the group-wide headcount (sum the facilities if a per-facility figure is what you find, and say it is a sum).
 4. HCM / HRIS / ATS — what system their job applications run on. Method: fetch the careers or jobs page (WebFetch the careers link from the home page, or {website}/careers) and read the host of the apply links. myworkdayjobs.com = Workday, greenhouse.io = Greenhouse, lever.co = Lever, icims.com = iCIMS, ultipro.com or ukg.com = UKG, paylocity.com = Paylocity, paycomonline.net = Paycom, paycor.com = Paycor, adp.com or workforcenow = ADP, bamboohr.com = BambooHR, applytojob.com = JazzHR, jobvite.com = Jobvite, smartrecruiters.com = SmartRecruiters, ashbyhq.com = Ashby, workable.com = Workable, isolvedhire or isolved = isolved, apploi.com = Apploi, hireology.com = Hireology, indeed-hosted or a plain email/web form = none. If there is no careers page, ONE WebSearch: site:indeed.com OR site:linkedin.com/jobs "${lead.company}" and read the apply destination of one posting. For a multi-facility group, check a second facility's posting if it is right there in the results; do not tour every facility.
 5. HQ AND WHERE THE OWNERS SIT — the headquarters address (from the same ZoomInfo company enrichment as fact 3) and, if the owners or executives sit somewhere else (common with nursing home groups whose owners are in New York or New Jersey while the facilities are elsewhere), that city and state from the ZoomInfo contact rows in fact 2.
-6. OWNER AND C-SUITE DIRECT CONTACT INFO — direct phone, mobile and email for the owner/CEO and up to two more C-suite or partner-level people. Method: ONE mcp__claude_ai_ZoomInfo__enrich_contacts call for the top three people from fact 2, in one batch. Take what it returns; do not go hunting elsewhere.
+6. PHONE NUMBERS AND EMAIL FOR THE LEADERSHIP — direct phone, mobile and email for the owner/CEO and every other owner or C-level person from fact 2, up to ten people. Method: ONE mcp__claude_ai_ZoomInfo__enrich_contacts call for all of them in one batch, requesting firstName, lastName, jobTitle, email, phone, mobilePhone, directPhoneDoNotCall, mobilePhoneDoNotCall, externalUrls. Take what it returns; do not go hunting elsewhere. Phone numbers are the strongest part of this product: a roster with numbers is the point of this pass.
 
 WORK EFFICIENTLY — the budget is the point of this mode:
-- Start with ONE ToolSearch: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_companies,mcp__claude_ai_ZoomInfo__search_contacts_v2,mcp__claude_ai_ZoomInfo__enrich_contacts". Never load tools one at a time.
-- Round 1, all in ONE message: the website fetch, the ZoomInfo company enrichment, and the ZoomInfo contact search. Round 2, all in ONE message: the careers page fetch, the contact enrichment, and whichever single extra WebSearch fact 3 or fact 4 calls for. That is normally the whole job.
-- HARD CEILING: TWELVE tool calls including the ToolSearch. If a method comes up empty, record the gap and move on. There is no escalation ladder in this mode and no second method for anything.
+- Start with ONE ToolSearch: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_companies,mcp__claude_ai_ZoomInfo__search_contacts_v2,mcp__claude_ai_ZoomInfo__enrich_contacts". Never load tools one at a time. Do not read any file, run any command or list any directory.
+- Round 1, all in ONE message: the website fetch, the ZoomInfo company enrichment, and the ZoomInfo contact search. Round 2, all in ONE message: the careers page fetch, the contact enrichment batch, and whichever single extra WebSearch fact 3 or fact 4 calls for. That is normally the whole job.
+- HARD CEILING: TWELVE tool calls including the ToolSearch. The server kills the session at ${wall} calls or $${config.maxCostBasic}, and a killed session returns nothing. If a method comes up empty, record the gap and move on. There is no escalation ladder in this mode and no second method for anything.
 - No commentary between tool calls. No narration. Hold everything for the final JSON.
-- Do NOT write anything to Zoho. A human reviews this first.
 
-When done, output ONLY a fenced json block as your entire final message — no prose before or after:
-
-\`\`\`json
+OUTPUT: your final answer is the JSON object below and nothing else (the structured output):
 {
-  "leadId": "${lead.id}",
-  "company": "${lead.company}",
-  "basic": {
-    "companyType": "",
-    "ownership": "",
-    "ceo": "",
-    "employees": null,
-    "employeesBasis": "stated | estimate | sum of facilities",
-    "officeStaff": null,
-    "fieldStaff": null,
-    "facilities": null,
-    "hcm": "",
-    "hcmEvidence": "",
-    "hq": "",
-    "execLocation": "",
-    "gaps": []
-  },
-  "employees": null,
-  "employeesBasis": "estimate",
-  "contactChanged": false,
-  "contact": {
-    "firstName": "", "lastName": "", "title": "",
-    "email": "", "emailVerified": false,
-    "directPhone": "", "directPhoneVerified": false,
-    "mobilePhone": "", "mobilePhoneVerified": false,
-    "linkedin": "",
-    "employmentVerifiedBy": "ZoomInfo, checked ${todayUS()}",
-    "replacesRecordContact": false
-  },
-  "additionalContacts": [
-    { "firstName": "", "lastName": "", "title": "", "functionalRole": "", "email": "", "directPhone": "", "reason": "c-suite" }
-  ],
-  "fields": {
-    "Website": "", "Street": "", "City": "", "State": "", "Zip_Code": "",
-    "Employee_Count": null, "Number_of_Locations": "", "Description": "",
-    "HCM": "", "LinkedIn_Company_Profile_URL": "", "Email_Domain": "",
-    "Entity_Name_Ultimate_Parent": ""
-  },
+  "leadId": "${lead.id}", "company": "${lead.company}",
+  "basic": { "companyType": "", "ownership": "", "ceo": "", "employees": null, "employeesBasis": "stated | estimate | sum of facilities", "officeStaff": null, "fieldStaff": null, "facilities": null, "hcm": "", "hcmEvidence": "", "hq": "", "execLocation": "", "gaps": [] },
+  "employees": null, "employeesBasis": "estimate", "contactChanged": false,
+  "contact": { "firstName": "", "lastName": "", "title": "", "email": "", "emailVerified": false, "directPhone": "", "directPhoneVerified": false, "directPhoneDNC": false, "mobilePhone": "", "mobilePhoneVerified": false, "mobilePhoneDNC": false, "linkedin": "", "employmentVerifiedBy": "ZoomInfo, checked ${todayUS()}", "replacesRecordContact": false },
+  "leadership": [ { "firstName": "", "lastName": "", "title": "", "functionalRole": "", "email": "", "directPhone": "", "directPhoneDNC": false, "mobilePhone": "", "mobilePhoneDNC": false, "linkedin": "", "source": "ZoomInfo", "date": "${todayUS()}" } ],
+  "additionalContacts": [ { "firstName": "", "lastName": "", "title": "", "functionalRole": "", "email": "", "directPhone": "", "reason": "displaced | c-suite" } ],
+  "fields": { "Website": "", "Street": "", "City": "", "State": "", "Zip_Code": "", "Employee_Count": null, "Number_of_Locations": "", "Description": "", "HCM": "", "LinkedIn_Company_Profile_URL": "", "Email_Domain": "", "Entity_Name_Ultimate_Parent": "" },
   "notes": { "BASIC PROFILE": "" },
   "needsHuman": null
 }
-\`\`\`
 
 Field rules:
-- "basic" is the six facts in plain words for the dashboard table. "gaps" lists which of the six you could not establish, e.g. ["hcm", "execLocation"]. An empty string or null elsewhere means not found; never write "not found", "N/A" or "unknown" as a value.
-- "contact" is the OWNER or CEO — the top person from fact 2 with whatever fact 6 returned. If the person already on the record IS an owner or C-suite person, keep them in "contact" (update their title, phone and email from ZoomInfo) and set "replacesRecordContact": false. If the record's person is not at that level, the owner/CEO goes in "contact" with "replacesRecordContact": true and "contactChanged": true, and the record's person goes in "additionalContacts" with reason "displaced". The other C-suite people from fact 6 fill the rest of "additionalContacts" (two slots at most are written).
-- "functionalRole" on an additional contact must be one of: CEO, Partner - Owner, President, CFO, Controller, Head of Finance, COO, Head of HR, HR Admin, HR Manager, Office Manager, Marketing, Payroll, Board Member, Sales Person, Unknown. Keep the real title in "title".
-- "employees" (top level and in "fields".Employee_Count) is the TOTAL workforce — office plus field for home care, the whole group for a facility operator. "Number_of_Locations" is the facility count as a string when there is one. "Entity_Name_Ultimate_Parent" is the group or parent company name when the lead is one facility of a group.
-- "fields".Street/City/State/Zip_Code are the HQ from fact 5. Omit any key you have no value for — do not send an empty string to hold a place.
+- "basic" is the six facts in plain words for the dashboard table. "gaps" lists which of the six you could not establish, e.g. ["hcm", "execLocation"]. An empty string or null elsewhere means not found; never write "not found", "N/A" or "unknown" as a value. Omit any "fields" key you have no value for.
+- "leadership" is REQUIRED: everyone from fact 2 with whatever fact 6 returned, owners first, then CEO/President, then the other chiefs. Include the primary too. The dashboard writes this list to the record as its own note and fills the two additional-contact slots from it.
+- "contact" is the OWNER or CEO — the top person from fact 2. If the person already on the record IS an owner or C-suite person, keep them in "contact" (update their title, phone and email from ZoomInfo) and set "replacesRecordContact": false. If the record's person is not at that level, the owner/CEO goes in "contact" with "replacesRecordContact": true and "contactChanged": true, and the record's person goes in "additionalContacts" with reason "displaced".
+- "functionalRole" on any person is one of: CEO, Partner - Owner, President, CFO, Controller, Head of Finance, COO, Head of HR, HR Admin, HR Manager, Office Manager, Marketing, Payroll, Board Member, Sales Person, Unknown. Keep the real title in "title".
+- "employees" (top level and in "fields".Employee_Count) is the TOTAL workforce — office plus field for home care, the whole group for a facility operator. "Number_of_Locations" is the facility count as a string when there is one. "Entity_Name_Ultimate_Parent" is the group or parent company name when the lead is one facility of a group. "fields".Street/City/State/Zip_Code are the HQ from fact 5.
 - "Description" is MANDATORY: ONE plain sentence saying what the company is, from fact 1 — "Sunrise Care Group operates eleven skilled nursing facilities in Pennsylvania and Ohio." Nothing else in it.
 - "HCM" is the platform name from fact 4 (e.g. "Paylocity"). If the ATS is one of ADP, Paycom, Paylocity, Paycor, UKG, isolved, Paychex or Rippling, say so plainly in the note — those are bundled suites, so the recruiting system is almost certainly their payroll provider too.
-- The "BASIC PROFILE" note is the six facts written for a rep, one line each, in this exact shape: a 2-8 word headline in plain capitals, then an em dash, then the detail, then the source in round brackets and the date in square brackets at the very end. Example line: "· OWNED BY TWO PARTNERS — Moshe Klein and David Roth own the group; Klein is the CEO. Both sit in Lakewood, New Jersey, while every facility is in Ohio. (ZoomInfo) [${todayUS()}]". Dates are US numeric with no leading zeros. Plain English everywhere — never "LI", "ZI", "ATS", "HCM" without saying what it is, never an abbreviation a rep would not know. Leave out any line for a fact you did not find; the note only carries what you established.
-- "needsHuman" is null unless the company identity is genuinely ambiguous (two companies with this name in this state, say) — then one short sentence.`;
+- The "BASIC PROFILE" note is the six facts written for a rep, one bullet each, in the style below. Example line: "· OWNED BY TWO PARTNERS — Moshe Klein and David Roth own the group; Klein is the CEO. Both sit in Lakewood, New Jersey, while every facility is in Ohio. (ZoomInfo) [${todayUS()}]". Leave out any line for a fact you did not find; the note only carries what you established. Do not list the roster in the note — the dashboard writes it separately from "leadership".
+- "needsHuman" is null unless the company identity is genuinely ambiguous (two companies with this name in this state, say) — then one short sentence.
+
+STYLE — identical to the comprehensive profile:
+${STYLE_SECTION}`);
 }
 
 // ---------------------------------------------------------------- job runner
@@ -1589,7 +1842,7 @@ Field rules:
 // Preflight is server-wide (it is a property of the server's Claude account).
 // Everything else — the browsed lead list, the active run — belongs to one user.
 const state = {
-  preflight: null,
+  preflight: readJSON(path.join(DATA, 'preflight.json'), null),
   perUser: new Map(),   // userId -> { leads, activeSegment, run }
 };
 function userState(userId) {
@@ -1618,7 +1871,8 @@ function loadRunFromDisk(userId) {
       const result = readJSON(path.join(dir, `${j.leadId}.json`), null);
       const lead = j.lead || { id: j.leadId, company: j.company, industry: j.result?.industry, state: j.result?.state };
       return {
-        leadId: j.leadId, company: j.company, lead,
+        leadId: j.leadId, company: j.company, lead, mode: j.mode || rec.mode || 'full',
+        fallback: j.fallback || (result && result.fallback) || null, attempts: j.attempts || [],
         status: j.status === 'running' || j.status === 'queued' ? 'failed' : j.status,
         progress: [], result, error: j.error || (j.status === 'running' || j.status === 'queued' ? 'The server restarted while this lead was in progress.' : null),
         cost: j.cost, toolCalls: j.toolCalls, startedAt: null, finishedAt: null,
@@ -1633,10 +1887,171 @@ async function pool(items, limit, worker) {
   const runners = Array.from({ length: Math.max(1, limit) }, async () => {
     while (queue.length) {
       const [i, item] = queue.shift();
-      await worker(item, i);
+      // One job blowing up must not take the other runners — or the run's
+      // "finished" mark — down with it.
+      try { await worker(item, i); } catch (err) { try { worker.onError?.(item, err); } catch {} }
     }
   });
   await Promise.all(runners);
+}
+
+// ---------------------------------------------------------------- normalizing a profile
+// Whatever model produced it, a result reaches the dashboard and the write path in
+// one shape: strings trimmed, absences dropped, numbers as numbers, people as
+// people, empty keys gone. The prompts ask for this; the server guarantees it.
+
+const boolish = (v) => v === true || v === 'true' || v === 1;
+const numish = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[,\s]/g, '')); return Number.isFinite(n) ? n : null; };
+const strOrEmpty = (v) => { const s = cleanStr(v); return s && !isAbsence(s) ? s : ''; };
+
+function cleanPerson(p) {
+  if (!p || typeof p !== 'object') return null;
+  const out = {
+    firstName: strOrEmpty(p.firstName), lastName: strOrEmpty(p.lastName), title: strOrEmpty(p.title),
+    functionalRole: strOrEmpty(p.functionalRole), email: cleanEmail(p.email), emailVerified: boolish(p.emailVerified),
+    directPhone: cleanPhone(p.directPhone || p.phone), directPhoneVerified: boolish(p.directPhoneVerified), directPhoneDNC: boolish(p.directPhoneDNC),
+    mobilePhone: cleanPhone(p.mobilePhone || p.mobile), mobilePhoneVerified: boolish(p.mobilePhoneVerified), mobilePhoneDNC: boolish(p.mobilePhoneDNC),
+    linkedin: strOrEmpty(p.linkedin), source: strOrEmpty(p.source || p.phoneSource), date: strOrEmpty(p.date), reason: strOrEmpty(p.reason),
+  };
+  if (p.priority != null) out.priority = numish(p.priority);
+  if (p.employmentVerifiedBy != null) out.employmentVerifiedBy = strOrEmpty(p.employmentVerifiedBy);
+  if (p.replacesRecordContact != null) out.replacesRecordContact = boolish(p.replacesRecordContact);
+  if (p.reachable != null) out.reachable = boolish(p.reachable);
+  return out;
+}
+
+function normalizeProfile(raw, lead, mode) {
+  const j = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const out = {
+    leadId: String(lead.id),
+    company: strOrEmpty(j.company) || lead.company,
+    disqualified: strOrEmpty(j.disqualified) || null,
+    contactChanged: boolish(j.contactChanged),
+    contact: cleanPerson(j.contact) || cleanPerson({}),
+    leadership: (Array.isArray(j.leadership) ? j.leadership : []).map(cleanPerson).filter((p) => p && p.lastName),
+    additionalContacts: (Array.isArray(j.additionalContacts) ? j.additionalContacts : []).map(cleanPerson).filter((p) => p && p.lastName),
+    entities: (Array.isArray(j.entities) ? j.entities : []).filter((e) => e && typeof e === 'object' && strOrEmpty(e.name)).map((e) => ({
+      name: strOrEmpty(e.name), ein: strOrEmpty(e.ein), state: strOrEmpty(e.state), role: strOrEmpty(e.role),
+      employees: numish(e.employees), source: strOrEmpty(e.source), date: strOrEmpty(e.date),
+    })),
+    fields: {}, notes: {},
+    needsHuman: strOrEmpty(j.needsHuman) || null,
+  };
+  if (out.contact.replacesRecordContact) out.contactChanged = true;
+
+  const NUMERIC_FIELDS = new Set(['Employee_Count', 'Company_Size', 'Employee_Growth']);
+  for (const [k, v] of Object.entries(j.fields && typeof j.fields === 'object' ? j.fields : {})) {
+    const key = String(k).trim();
+    if (!key) continue;
+    if (NUMERIC_FIELDS.has(key)) { const n = numish(v); if (n != null) out.fields[key] = n; continue; }
+    if (typeof v === 'boolean') { out.fields[key] = v; continue; }
+    if (typeof v === 'number') { if (Number.isFinite(v)) out.fields[key] = v; continue; }
+    const s = strOrEmpty(v);
+    if (s) out.fields[key] = s;
+  }
+  for (const [k, v] of Object.entries(j.notes && typeof j.notes === 'object' ? j.notes : {})) {
+    const key = String(k).trim().toUpperCase();
+    const body = typeof v === 'string' ? v.trim() : (v && typeof v === 'object' ? JSON.stringify(v) : '');
+    if (key && body && !isAbsence(key)) out.notes[key] = body;
+  }
+
+  out.employees = numish(j.employees);
+  if (out.employees == null && out.fields.Employee_Count != null) out.employees = out.fields.Employee_Count;
+  if (out.employees != null && out.fields.Employee_Count == null) out.fields.Employee_Count = out.employees;
+  out.employeesBasis = strOrEmpty(j.employeesBasis) || 'estimate';
+
+  if (mode === 'basic') {
+    const b = j.basic && typeof j.basic === 'object' ? j.basic : {};
+    out.basic = {
+      companyType: strOrEmpty(b.companyType), ownership: strOrEmpty(b.ownership), ceo: strOrEmpty(b.ceo),
+      employees: numish(b.employees), employeesBasis: strOrEmpty(b.employeesBasis),
+      officeStaff: numish(b.officeStaff), fieldStaff: numish(b.fieldStaff), facilities: numish(b.facilities),
+      hcm: strOrEmpty(b.hcm), hcmEvidence: strOrEmpty(b.hcmEvidence), hq: strOrEmpty(b.hq), execLocation: strOrEmpty(b.execLocation),
+      gaps: (Array.isArray(b.gaps) ? b.gaps : []).map(cleanStr).filter(Boolean),
+    };
+    if (out.employees == null) out.employees = out.basic.employees;
+  } else {
+    const cov = j.coverage && typeof j.coverage === 'object' ? j.coverage : {};
+    out.coverage = {};
+    for (const k of ['directPhone', 'email', 'provider', 'headcount', 'socialIcebreaker', 'publicRecord']) out.coverage[k] = boolish(cov[k]);
+    // The dashboard's own facts beat the model's self-report where it can tell.
+    if (out.contact.directPhone || out.contact.mobilePhone) out.coverage.directPhone = true;
+    if (out.contact.email) out.coverage.email = true;
+    if (out.fields.Current_PR_Provider_new) out.coverage.provider = true;
+    if (out.employees != null) out.coverage.headcount = true;
+  }
+  const roster = leadershipRoster(out);
+  out.leadershipPhones = roster.filter((p) => p.directPhone || p.mobilePhone).length;
+  out.leadershipCount = roster.length;
+  if (out.coverage) out.coverage.leadershipPhones = out.leadershipPhones >= 2;
+  return out;
+}
+
+// ---------------------------------------------------------------- the profile ladder
+// One lead, start to finish, whatever happens to the session:
+//   1. the pass the run asked for (comprehensive or basic), with every hard stop on;
+//   2. if a comprehensive pass was stopped or came back empty and fallback is on,
+//      a basic pass — so the rep gets six facts and a roster instead of nothing;
+//   3. failed, with the reason, and the run moves on.
+// There is no path that runs a session more than twice, and no path that waits on
+// a session past its timeout.
+async function profileLead(job, run, user, dir) {
+  const wantBasic = run.mode === 'basic';
+  const onEvent = ({ kind, msg }) => {
+    job.progress.push({ kind, msg, at: Date.now() });
+    if (job.progress.length > 400) job.progress.shift();
+    emit('progress', { leadId: job.leadId, kind, msg }, user.id);
+  };
+  const common = { label: job.company, cwd: dir, onEvent, group: run.id, disallowed: RESEARCH_DISALLOWED, cancelled: () => !!run.cancelled };
+  const basicOpts = (attempt, fallbackReason) => [basicPrompt(job.lead, { fallbackReason }), {
+    ...common, timeoutMin: Number(config.basicTimeoutMin) || 12, maxCost: Number(config.maxCostBasic) || 0.75,
+    maxToolCalls: Number(config.maxToolCallsBasic) || 16, schema: BASIC_SCHEMA,
+    logFile: path.join(dir, `${job.leadId}.${attempt}.log.jsonl`),
+  }];
+  const fullOpts = (attempt) => [profilePrompt(job.lead), {
+    ...common, timeoutMin: Number(config.perLeadTimeoutMin) || 25, maxCost: Number(config.maxCostFull) || 6,
+    maxToolCalls: Number(config.maxToolCallsFull) || 100, schema: PROFILE_SCHEMA,
+    logFile: path.join(dir, `${job.leadId}.${attempt}.log.jsonl`),
+  }];
+
+  job.attempts = [];
+  const record = (mode, res) => {
+    job.attempts.push({ mode, ok: res.ok, stopped: res.stopped || null, error: res.error || null, cost: res.cost, costEstimated: !!res.costEstimated, tokens: res.usage || null, toolCalls: res.toolCalls, turns: res.turns });
+    if (res.costEstimated) job.costEstimated = true;
+    job.cost = (job.cost || 0) + (res.cost || 0);
+    job.toolCalls = (job.toolCalls || 0) + (res.toolCalls || 0);
+  };
+
+  // A basic run fans out wide and skips the server-wide semaphore: those sessions
+  // are a dozen tool calls each, and the semaphore exists to stop six deep
+  // research sessions from starving one another, not to serialise a quick sweep.
+  let res;
+  if (run.cancelled) return { error: `Run stopped by ${run.cancelled} before this lead started.` };
+  if (wantBasic) {
+    res = await runClaudeNow(...basicOpts('basic'));
+    record('basic', res);
+    if (res.ok) return { result: normalizeProfile(res.json, job.lead, 'basic'), mode: 'basic' };
+    return { error: res.error };
+  }
+
+  res = await runClaude(...fullOpts('full'));
+  record('full', res);
+  if (res.ok) return { result: normalizeProfile(res.json, job.lead, 'full'), mode: 'full' };
+  if (run.cancelled) return { error: res.error };
+
+  const reason = res.stopped === 'budget' ? `hit the $${config.maxCostFull} cost ceiling`
+    : res.stopped ? res.stopped : (res.error || 'returned nothing usable');
+  if (!config.fallbackToBasic) return { error: `Full profile failed — ${reason}.` };
+
+  onEvent({ kind: 'note', msg: `Full profile ${reason}. Falling back to a basic profile so this lead still comes back with something.` });
+  const res2 = await runClaudeNow(...basicOpts('fallback', reason));
+  record('basic', res2);
+  if (res2.ok) {
+    const result = normalizeProfile(res2.json, job.lead, 'basic');
+    result.fallback = { from: 'full', reason };
+    return { result, mode: 'basic', fallback: result.fallback };
+  }
+  return { error: `Full profile ${reason}; the basic fallback then ${res2.stopped || res2.error || 'failed'} too.` };
 }
 
 async function startRun(user, leads, pepm, mode = 'full') {
@@ -1648,9 +2063,10 @@ async function startRun(user, leads, pepm, mode = 'full') {
 
   const run = us.run = {
     id, userId: user.id, userName: user.name, startedAt: Date.now(), finishedAt: null, pepm, mode,
+    cancelled: null,
     jobs: leads.map((l) => ({
-      leadId: l.id, company: l.company, lead: l,
-      status: 'queued', progress: [], result: null,
+      leadId: l.id, company: l.company, lead: l, mode,
+      status: 'queued', progress: [], result: null, fallback: null, attempts: [],
       error: null, cost: null, toolCalls: 0,
       startedAt: null, finishedAt: null,
       written: false, writeResult: null,
@@ -1661,43 +2077,38 @@ async function startRun(user, leads, pepm, mode = 'full') {
   persistRun(run);
   emit('run:start', { run: publicRun(run) }, user.id);
 
-  // A basic run fans out wide and skips the server-wide semaphore: those sessions
-  // are a dozen tool calls each, and the semaphore exists to stop six deep
-  // research sessions from starving one another, not to serialise a quick sweep.
   const limit = basic ? Math.max(1, Number(config.basicConcurrency) || 20) : config.concurrency;
-  const runOne = basic
-    ? (prompt, opts) => runClaudeNow(prompt, { ...opts, timeoutMin: Number(config.basicTimeoutMin) || 12 })
-    : runClaude;
-  pool(run.jobs, limit, async (job) => {
+  const worker = async (job) => {
+    if (run.cancelled) {
+      job.status = 'failed'; job.error = `Run stopped by ${run.cancelled} before this lead started.`;
+      emit('job', { job: publicJob(job) }, user.id);
+      return;
+    }
     job.status = 'running';
     job.startedAt = Date.now();
     emit('job', { job: publicJob(job) }, user.id);
 
-    const res = await runOne(basic ? basicPrompt(job.lead) : profilePrompt(job.lead, pepm), {
-      label: job.company,
-      cwd: dir,
-      logFile: path.join(dir, `${job.leadId}.log.jsonl`),
-      onEvent: ({ kind, msg }) => {
-        job.progress.push({ kind, msg, at: Date.now() });
-        if (job.progress.length > 400) job.progress.shift();
-        emit('progress', { leadId: job.leadId, kind, msg }, user.id);
-      },
-    });
+    let outcome;
+    try { outcome = await profileLead(job, run, user, dir); }
+    catch (err) { outcome = { error: `Profiling crashed: ${err.message}` }; }
 
     job.finishedAt = Date.now();
-    job.cost = res.cost;
-    job.toolCalls = res.toolCalls;
-    if (res.json) {
-      job.result = res.json;
+    if (outcome.result) {
+      job.result = outcome.result;
+      job.mode = outcome.mode;
+      job.fallback = outcome.fallback || null;
       job.status = 'done';
-      fs.writeFileSync(path.join(dir, `${job.leadId}.json`), JSON.stringify(res.json, null, 2));
+      try { fs.writeFileSync(path.join(dir, `${job.leadId}.json`), JSON.stringify(outcome.result, null, 2)); } catch {}
     } else {
       job.status = 'failed';
-      job.error = res.error || 'Session finished but returned no parseable JSON. Check this lead’s log.';
+      job.error = outcome.error || 'Session finished but returned no parseable JSON. Check this lead’s log.';
     }
     persistRun(run);
     emit('job', { job: publicJob(job) }, user.id);
-  }).catch((err) => {
+  };
+  worker.onError = (job, err) => { job.status = 'failed'; job.error = `Profiling crashed: ${err.message}`; job.finishedAt = Date.now(); persistRun(run); emit('job', { job: publicJob(job) }, user.id); };
+
+  pool(run.jobs, limit, worker).catch((err) => {
     emit('status', { msg: `Run stopped unexpectedly: ${err.message}` }, user.id);
   }).then(() => {
     run.finishedAt = Date.now();
@@ -1706,6 +2117,20 @@ async function startRun(user, leads, pepm, mode = 'full') {
   });
 
   return id;
+}
+
+// Stop a run: every live session in it is killed, queued leads are skipped, and
+// whatever already finished stays in Review. This is the button that did not exist
+// when a lead circled for hours.
+function cancelRun(run, who) {
+  if (!run || run.finishedAt) return 0;
+  run.cancelled = who;
+  const killed = stopGroup(run.id, `stopped by ${who}`);
+  for (const j of run.jobs) {
+    if (j.status === 'queued') { j.status = 'failed'; j.error = `Run stopped by ${who} before this lead started.`; }
+  }
+  persistRun(run);
+  return killed;
 }
 
 function persistRun(run) {
@@ -1718,13 +2143,15 @@ function persistRun(run) {
     finishedAt: run.finishedAt,
     pepm: run.pepm,
     mode: run.mode || 'full',
+    cancelled: run.cancelled || null,
     jobs: run.jobs.map((j) => ({
-      leadId: j.leadId, company: j.company, status: j.status,
+      leadId: j.leadId, company: j.company, status: j.status, mode: j.mode || run.mode || 'full',
+      fallback: j.fallback || null, attempts: j.attempts || [],
       // The browsed row is kept so a restored run can re-render the picker
       // columns and re-run a lead without another Zoho read.
       lead: j.lead ? { id: j.lead.id, company: j.lead.company, city: j.lead.city, state: j.lead.state,
         industry: j.lead.industry, contact: j.lead.contact, title: j.lead.title, owner: j.lead.owner || null } : null,
-      cost: j.cost, toolCalls: j.toolCalls,
+      cost: j.cost, costEstimated: !!j.costEstimated, toolCalls: j.toolCalls,
       durationMs: j.finishedAt && j.startedAt ? j.finishedAt - j.startedAt : null,
       written: j.written, writeResult: j.writeResult || null, error: j.error,
       // No score, tier, confidence or estimated value is kept: the bot does not
@@ -1739,6 +2166,8 @@ function persistRun(run) {
         industry: j.lead?.industry || null, state: j.lead?.state || null,
         coverage: j.result.coverage || {},
         provider: (j.result.fields && j.result.fields.Current_PR_Provider_new) || null,
+        leadershipCount: j.result.leadershipCount || 0, leadershipPhones: j.result.leadershipPhones || 0,
+        fallback: j.result.fallback || null,
         company: j.company,
       } : null,
     })),
@@ -1748,14 +2177,15 @@ function persistRun(run) {
 }
 
 const publicJob = (j) => ({
-  leadId: j.leadId, company: j.company, status: j.status,
+  leadId: j.leadId, company: j.company, status: j.status, mode: j.mode || 'full', costEstimated: !!j.costEstimated,
+  fallback: j.fallback || null, attempts: j.attempts || [],
   progress: j.progress.slice(-40), result: j.result, error: j.error,
   cost: j.cost, toolCalls: j.toolCalls, startedAt: j.startedAt,
   finishedAt: j.finishedAt, written: j.written, writeResult: j.writeResult,
   lead: j.lead,
 });
 const publicRun = (run) => run && ({
-  id: run.id, userId: run.userId, userName: run.userName, restored: !!run.restored,
+  id: run.id, userId: run.userId, userName: run.userName, restored: !!run.restored, cancelled: run.cancelled || null,
   startedAt: run.startedAt, finishedAt: run.finishedAt,
   pepm: run.pepm, mode: run.mode || 'full', jobs: run.jobs.map(publicJob),
 });
@@ -1768,7 +2198,7 @@ function computeStats(scope = {}) {
   const runs = history.runs.filter((r) => !scope.userId || r.userId === scope.userId);
   for (const run of runs) {
     for (const j of run.jobs) {
-      if (j.result) leads.push({ ...j.result, run: run.id, mode: run.mode || 'full', at: run.startedAt, cost: j.cost, durationMs: j.durationMs, written: j.written, userId: run.userId, userName: run.userName });
+      if (j.result) leads.push({ ...j.result, run: run.id, mode: j.mode || run.mode || 'full', at: run.startedAt, cost: j.cost, durationMs: j.durationMs, written: j.written, userId: run.userId, userName: run.userName });
     }
   }
   // Who has been profiling what — the question a manager asks of a shared tool.
@@ -1837,6 +2267,9 @@ function computeStats(scope = {}) {
     coverage,
     providerCounts,
     writtenCount: leads.filter((l) => l.written).length,
+    fallbacks: leads.filter((l) => l.fallback).length,
+    leadershipPhones: sum(leads.map((l) => l.leadershipPhones)),
+    avgLeadershipPhones: leads.length ? sum(leads.map((l) => l.leadershipPhones)) / leads.length : 0,
     contactChanged: leads.filter((l) => l.contactChanged).length,
     secondContactAdded: leads.filter((l) => (l.additionalContacts || 0) > 0).length,
     disqualified: leads.filter((l) => l.disqualified).length,
@@ -1847,7 +2280,10 @@ function computeStats(scope = {}) {
     recentRuns: runs.slice(-12).reverse().map((r) => ({
       id: r.id, at: r.startedAt, n: r.jobs.length, userName: r.userName || null, mode: r.mode || 'full',
       done: r.jobs.filter((j) => j.status === 'done' || j.status === 'written').length,
+      failed: r.jobs.filter((j) => j.status === 'failed').length,
+      fallbacks: r.jobs.filter((j) => j.fallback).length,
       written: r.jobs.filter((j) => j.written).length,
+      cost: r.jobs.reduce((n, j) => n + (j.cost || 0), 0),
     })),
   };
 }
@@ -1911,7 +2347,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // Anything below is fine to reach signed out.
-    if (p === '/healthz') return send(res, 200, { ok: true, users: users.length, liveSessions });
+    if (p === '/healthz') return send(res, 200, { ok: true, users: users.length, liveSessions, liveProcesses: liveChildren.size });
 
     if (p === '/login' && req.method === 'GET') {
       return send(res, 200, loginPage(), 'text/html; charset=utf-8');
@@ -2002,12 +2438,23 @@ const server = http.createServer(async (req, res) => {
         if (body.pepm) { config.pepm = Number(body.pepm) || config.pepm; writeJSON(CONFIG_PATH, config); }
         return send(res, 200, { config: { pepm: config.pepm, concurrency: config.concurrency, basicConcurrency: config.basicConcurrency, maxSessions: config.maxSessions } });
       }
-      const allowed = ['pepm', 'concurrency', 'basicConcurrency', 'basicTimeoutMin', 'maxSessions', 'claudeCmd', 'model', 'perLeadTimeoutMin'];
+      const allowed = ['pepm', 'concurrency', 'basicConcurrency', 'basicTimeoutMin', 'maxSessions', 'claudeCmd', 'model',
+        'fallbackModel', 'utilityModel', 'perLeadTimeoutMin', 'maxCostFull', 'maxCostBasic', 'maxToolCallsFull', 'maxToolCallsBasic',
+        'idleKillMin', 'fallbackToBasic'];
       for (const k of allowed) if (body[k] !== undefined) config[k] = body[k];
       config.concurrency = Math.max(1, Math.min(8, Number(config.concurrency) || 3));
       config.basicConcurrency = Math.max(1, Math.min(40, Number(config.basicConcurrency) || 20));
       config.basicTimeoutMin = Math.max(3, Math.min(30, Number(config.basicTimeoutMin) || 12));
       config.maxSessions = Math.max(1, Math.min(24, Number(config.maxSessions) || 6));
+      config.perLeadTimeoutMin = Math.max(5, Math.min(60, Number(config.perLeadTimeoutMin) || 25));
+      config.maxCostFull = Math.max(0.5, Math.min(50, Number(config.maxCostFull) || 6));
+      config.maxCostBasic = Math.max(0.1, Math.min(5, Number(config.maxCostBasic) || 0.75));
+      config.maxToolCallsFull = Math.max(20, Math.min(300, Number(config.maxToolCallsFull) || 100));
+      config.maxToolCallsBasic = Math.max(6, Math.min(40, Number(config.maxToolCallsBasic) || 16));
+      config.idleKillMin = Math.max(2, Math.min(20, Number(config.idleKillMin) || 6));
+      config.fallbackToBasic = config.fallbackToBasic !== false && config.fallbackToBasic !== 'false';
+      for (const k of ['model', 'fallbackModel', 'utilityModel', 'claudeCmd']) config[k] = String(config[k] || '').trim();
+      if (!config.claudeCmd) config.claudeCmd = 'claude';
       writeJSON(CONFIG_PATH, config);
       // Let anyone queued behind an old cap through if it just went up.
       while (sessionWaiters.length && liveSessions < config.maxSessions) { liveSessions++; sessionWaiters.shift()(); }
@@ -2175,12 +2622,23 @@ const server = http.createServer(async (req, res) => {
       if (!admin) return forbidden();
       emit('status', { msg: 'Running preflight…' }, user.id);
       const r = await runClaude(PREFLIGHT_PROMPT, {
-        label: 'preflight', timeoutMin: 5,
+        label: 'preflight', timeoutMin: 5, model: config.utilityModel || undefined, maxCost: 0.5, maxToolCalls: 6,
+        schema: PREFLIGHT_SCHEMA, disallowed: RESEARCH_DISALLOWED,
         logFile: path.join(RUNS, 'preflight.log.jsonl'),
         onEvent: ({ msg }) => emit('status', { msg }, user.id),
       });
+      const prev = (state.preflight && state.preflight.toolPrefixes) || null;
       state.preflight = r.json || { error: r.error || 'Preflight returned nothing parseable.', raw: (r.text || '').slice(0, 800) };
+      // Only a prefix that looks like one is trusted; anything else keeps the last
+      // known good value (or the desktop default).
+      const tp = state.preflight.toolPrefixes && typeof state.preflight.toolPrefixes === 'object' ? state.preflight.toolPrefixes : {};
+      const okPrefix = (s) => typeof s === 'string' && /^mcp__[A-Za-z0-9_]+__$/.test(s);
+      state.preflight.toolPrefixes = {
+        zoominfo: okPrefix(tp.zoominfo) ? tp.zoominfo : (prev && prev.zoominfo) || null,
+        zoho: okPrefix(tp.zoho) ? tp.zoho : (prev && prev.zoho) || null,
+      };
       state.preflight.at = Date.now();
+      writeJSON(path.join(DATA, 'preflight.json'), state.preflight);
       emit('preflight', { preflight: state.preflight });
       return send(res, 200, { preflight: state.preflight });
     }
@@ -2194,7 +2652,7 @@ const server = http.createServer(async (req, res) => {
       const seg = sc.lockOwner ? { ...seg0, where: `(${seg0.where} and Owner = '${qEsc(sc.lockOwner)}')` } : seg0;
       emit('status', { msg: `Fetching leads — ${seg.name}…` }, user.id);
       const r = await runClaude(fetchPrompt(seg), {
-        label: 'fetch', timeoutMin: 6,
+        label: 'fetch', timeoutMin: 6, model: config.utilityModel || undefined, maxCost: 1,
         logFile: path.join(RUNS, 'fetch.log.jsonl'),
         onEvent: ({ kind, msg }) => emit('status', { msg: kind === 'tool' ? msg : msg.slice(0, 120) }, user.id),
       });
@@ -2224,10 +2682,26 @@ const server = http.createServer(async (req, res) => {
       const mode = body.mode === 'basic' ? 'basic' : 'full';
       if (mode === 'full' && chosen.length > 50) return send(res, 400, { error: 'Fifty leads per comprehensive run at most. Use Basic profile for a larger sweep.' });
       if (mode === 'basic' && chosen.length > 300) return send(res, 400, { error: 'Three hundred leads per basic run at most.' });
+      // A lead profiled in the last week costs a full lead's worth of credits to do
+      // again. Say so once and let the person insist.
+      if (!body.force) {
+        const week = 7 * 24 * 3600 * 1000;
+        const recent = chosen.filter((l) => l.profiledDate && Date.now() - new Date(l.profiledDate).getTime() < week);
+        if (recent.length) return send(res, 409, { error: 'recent', recent: recent.map((l) => ({ id: l.id, company: l.company, profiledDate: l.profiledDate, profileType: l.profileType || null })) });
+      }
       const pepm = body.pepm || config.pepm;
       if (pepm !== config.pepm) { config.pepm = pepm; writeJSON(CONFIG_PATH, config); }
       const id = await startRun(user, chosen, pepm, mode);
       return send(res, 200, { runId: id });
+    }
+
+    if (p === '/api/run/cancel' && req.method === 'POST') {
+      const run = us.run;
+      if (!run || run.finishedAt) return send(res, 400, { error: 'No run is going.' });
+      const killed = cancelRun(run, user.name);
+      emit('status', { msg: `Run stopped — ${killed} live session${killed === 1 ? '' : 's'} killed.` }, user.id);
+      emit('run:start', { run: publicRun(run) }, user.id);
+      return send(res, 200, { ok: true, killed });
     }
 
     if (p === '/api/write' && req.method === 'POST') {
@@ -2246,7 +2720,7 @@ const server = http.createServer(async (req, res) => {
         if (direct) {
           emit('progress', { leadId: job.leadId, kind: 'note', msg: 'Writing to Zoho directly…' }, user.id);
           try {
-            job.writeResult = await writeLeadDirect(job.result, run.mode || 'full');
+            job.writeResult = await writeLeadDirect(job.result, job.mode || run.mode || 'full');
           } catch (err) {
             job.writeResult = { ok: false, partial: false, leadId: job.leadId, fieldsWritten: [], notesWritten: [], newLeadId: null, skipped: [], error: err.message };
           }
@@ -2257,7 +2731,7 @@ const server = http.createServer(async (req, res) => {
               : job.writeResult.error || 'Write failed.',
           }, user.id);
         } else {
-          const r = await runClaude(writePrompt(job.result, run.pepm, run.mode || 'full'), {
+          const r = await runClaude(writePrompt(job.result, run.pepm, job.mode || run.mode || 'full'), {
             label: `write ${job.company}`, timeoutMin: 10,
             cwd: path.join(RUNS, run.id),
             logFile: path.join(RUNS, run.id, `${job.leadId}.write.jsonl`),
@@ -2298,9 +2772,10 @@ const server = http.createServer(async (req, res) => {
 const PORT = Number(process.env.PORT) || config.port;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n  Lead Bot Cloud is listening on ${PORT}.\n  Storage: ${STORAGE}\n  Accounts: ${users.length}\n`);
-  if (!fs.existsSync(skillPath('SKILL.md'))) {
-    console.warn(`  WARNING: skill files not found at ${SKILL_DIR}\n  Profile sessions are told to read them from that exact path and will fail without them.\n`);
+  if (!PROFILE_BRIEF || !STYLE_SECTION) {
+    console.warn(`  WARNING: ${skillPath('HEADLESS.md')} is missing or has lost its style section.\n  Profile prompts embed that file; sessions will run without the rulebook until it is restored.\n`);
   }
+  console.log(`  Model: ${config.model || '(CLI default)'} · caps: $${config.maxCostFull}/full, $${config.maxCostBasic}/basic, ${config.maxToolCallsFull}/${config.maxToolCallsBasic} tool calls, ${config.perLeadTimeoutMin}/${config.basicTimeoutMin} min, idle ${config.idleKillMin} min · fallback to basic: ${config.fallbackToBasic ? 'on' : 'off'}\n`);
   if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
     console.warn('  WARNING: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set. Profiling sessions will not be able to sign in.\n');
   }

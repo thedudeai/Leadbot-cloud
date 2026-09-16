@@ -326,9 +326,19 @@
       <div class="field"><label for="c-bconc">Basic profiles at once, per person</label><input id="c-bconc" type="number" min="1" max="40" /></div>
       <div class="field"><label for="c-max">Claude sessions at once, whole company</label><input id="c-max" type="number" min="1" max="24" /></div>
       <div class="field"><label for="c-cmd">Claude command</label><input id="c-cmd" /></div>
-      <div class="field"><label for="c-model">Model (blank = CLI default)</label><input id="c-model" placeholder="e.g. opus" /></div>
-      <div class="field"><label for="c-timeout">Full profile timeout (min)</label><input id="c-timeout" type="number" min="5" max="90" /></div>
+      <div class="field"><label for="c-model">Research model</label><select id="c-model"><option value="sonnet">Sonnet — cheapest, same rules and output shape</option><option value="opus">Opus — deeper, several times the cost</option><option value="fable">Fable — deepest, highest cost</option><option value="">CLI default</option></select></div>
+      <div class="field"><label for="c-timeout">Full profile timeout (min)</label><input id="c-timeout" type="number" min="5" max="60" /></div>
       <div class="field"><label for="c-btimeout">Basic profile timeout (min)</label><input id="c-btimeout" type="number" min="3" max="30" /></div>
+    </div>
+    <h3 style="margin:18px 0 6px;font-size:13px">Hard stops</h3>
+    <p class="muted tiny" style="margin:0 0 10px">Each of these ends a session on its own. A full profile that gets stopped falls back to a basic profile, so the lead still comes back with six facts and a leadership roster instead of nothing. Every model runs the same prompt and the server formats the output the same way, so switching the model changes depth and cost, never what a record looks like.</p>
+    <div class="segs">
+      <div class="field"><label for="c-costfull">Max $ per full profile</label><input id="c-costfull" type="number" min="0.5" max="50" step="0.5" /></div>
+      <div class="field"><label for="c-costbasic">Max $ per basic profile</label><input id="c-costbasic" type="number" min="0.1" max="5" step="0.05" /></div>
+      <div class="field"><label for="c-callsfull">Max tool calls, full</label><input id="c-callsfull" type="number" min="20" max="300" /></div>
+      <div class="field"><label for="c-callsbasic">Max tool calls, basic</label><input id="c-callsbasic" type="number" min="6" max="40" /></div>
+      <div class="field"><label for="c-idle">Kill after silence (min)</label><input id="c-idle" type="number" min="2" max="20" /></div>
+      <div class="field"><label for="c-fallback">If a full profile is stopped</label><select id="c-fallback"><option value="true">Fall back to a basic profile</option><option value="false">Mark the lead failed</option></select></div>
     </div>
     <div class="row" style="margin-top:14px">
       <button class="btn primary" id="c-save">Save settings</button>
@@ -671,9 +681,15 @@ function renderPicker() {
   if ($('#prev')) $('#prev').onclick = () => { if (browse.page > 1) { browse.page--; browseFetch(); } };
   if ($('#next')) $('#next').onclick = () => { if (pageInfo.hasMore) { browse.page++; browseFetch(); } };
   if ($('#per')) $('#per').onchange = () => { browse.per = Number($('#per').value) || 50; browse.page = 1; browseFetch(); };
-  const kick = async (mode) => {
+  const kick = async (mode, force) => {
     $('#start').disabled = true; $('#start-basic').disabled = true;
-    const r = await api('/api/run', { leads: Array.from(picked.values()), pepm: Number($('#pepm').value) || S.config.pepm, mode });
+    const r = await api('/api/run', { leads: Array.from(picked.values()), pepm: Number($('#pepm').value) || S.config.pepm, mode, force: !!force });
+    if (r.error === 'recent' && r.recent) {
+      // A lead done in the last week costs a whole lead's credits to do again.
+      const names = r.recent.map((x) => x.company + ' (' + (x.profileType || 'profiled') + ' ' + new Date(x.profiledDate).toLocaleDateString() + ')').join('\n');
+      if (confirm(r.recent.length + ' of these leads ' + (r.recent.length === 1 ? 'was' : 'were') + ' profiled in the last 7 days:\n\n' + names + '\n\nProfile them again anyway?')) return kick(mode, true);
+      $('#start').disabled = false; $('#start-basic').disabled = false; return;
+    }
     if (r.error) { $('#run-banner').innerHTML = '<div class="banner bad">' + esc(r.error) + '</div>'; $('#start').disabled = false; $('#start-basic').disabled = false; }
   };
   $('#start').onclick = () => kick('full');
@@ -690,11 +706,21 @@ function renderLive() {
   const running = jobs.some((j) => j.status === 'running' || j.status === 'writing');
   setDot(running ? 'busy' : 'live', running ? 'Working — ' + done + '/' + jobs.length + ' done' : 'Idle.');
 
+  const cost = jobs.reduce((n, j) => n + (j.cost || 0), 0);
   host.innerHTML =
-    '<h2>Run ' + esc(S.run.id) + ' ' + modePill(S.run) + ' — ' + done + '/' + jobs.length + ' finished</h2>' +
+    '<h2>Run ' + esc(S.run.id) + ' ' + modePill(S.run) + ' — ' + done + '/' + jobs.length + ' finished' + (cost ? ' <span class="muted tiny">$' + cost.toFixed(2) + ' so far</span>' : '') + '</h2>' +
     (S.run.restored ? '<p class="muted tiny" style="margin:-6px 0 12px">Restored from ' + new Date(S.run.startedAt).toLocaleString() + ' — your last run, brought back after the server restarted. Anything not yet written is still waiting in Review.</p>' : '') +
+    (S.run.cancelled ? '<div class="banner warn">This run was stopped by ' + esc(S.run.cancelled) + '. Leads that had already finished are in Review.</div>' : '') +
     jobs.map(renderJob).join('') +
-    (S.run.finishedAt ? '<div class="bar-sticky"><button class="btn primary" onclick="go(\'review\')">Review ' + done + ' result' + (done === 1 ? '' : 's') + '</button></div>' : '');
+    (S.run.finishedAt
+      ? '<div class="bar-sticky"><button class="btn primary" onclick="go(\'review\')">Review ' + done + ' result' + (done === 1 ? '' : 's') + '</button></div>'
+      : '<div class="bar-sticky"><button class="btn ghost sm" id="stop-run">Stop this run</button><span class="muted tiny">Kills every live session and skips the queue. Finished leads stay in Review.</span></div>');
+  if ($('#stop-run')) $('#stop-run').onclick = async () => {
+    if (!confirm('Stop this run now? Sessions in progress are killed and their leads come back as failed.')) return;
+    $('#stop-run').disabled = true;
+    const r = await api('/api/run/cancel', {});
+    if (r.error) { $('#stop-run').disabled = false; alert(r.error); }
+  };
 }
 
 function renderJob(j) {
@@ -706,9 +732,10 @@ function renderJob(j) {
     '<div class="' + esc(p.kind) + '">' + (p.kind === 'tool' ? '› ' : '') + esc(p.msg) + '</div>').join('');
   const mins = j.startedAt ? Math.round(((j.finishedAt || Date.now()) - j.startedAt) / 60000) : 0;
   return '<div class="job"><div class="job-head">' + icon +
-    '<b>' + esc(j.company) + '</b><span class="muted tiny">' + esc(j.status) +
+    '<b>' + esc(j.company) + '</b>' + (j.fallback ? ' <span class="pill flag" title="' + esc(j.fallback.reason || '') + '">fell back to basic</span>' : '') +
+    '<span class="muted tiny">' + esc(j.status) +
     (j.startedAt ? ' · ' + mins + 'm · ' + j.toolCalls + ' calls' : '') +
-    (j.cost ? ' · $' + j.cost.toFixed(2) : '') + '</span></div>' +
+    (j.cost ? ' · $' + j.cost.toFixed(2) + (j.costEstimated ? ' est.' : '') : '') + '</span></div>' +
     (j.error ? '<div class="feed" style="color:var(--bad)">' + esc(j.error) + '</div>' : (feed ? '<div class="feed">' + feed + '</div>' : '')) +
     '</div>';
 }
@@ -724,10 +751,13 @@ function renderReview() {
   const basic = isBasic(S.run);
   const noDesc = (j) => !(j.result.fields && String(j.result.fields.Description || '').trim());
   const flagged = jobs.filter((j) => j.result.needsHuman || j.result.contactChanged || noDesc(j));
+  const fell = jobs.filter((j) => j.fallback);
   host.innerHTML =
     '<p class="muted tiny" style="margin:-6px 0 12px">' + modePill(S.run) + ' ' + (basic
       ? 'Six facts per lead, one lookup each. Writing stamps the record <b>Profile Type: Basic</b> so you can tell it apart from a full profile later.'
       : 'Full research profile. Writing stamps the record <b>Profile Type: Comprehensive</b>.') + '</p>' +
+    (fell.length ? '<div class="banner warn"><b>' + fell.length + ' lead' + (fell.length === 1 ? '' : 's') + ' came back as a basic profile instead of a full one</b> — the full session was stopped (' +
+      fell.map((j) => esc(j.company) + ': ' + esc((j.fallback && j.fallback.reason) || '')).join('; ') + '). They write as <b>Profile Type: Basic</b> and can be re-run later.</div>' : '') +
     (flagged.length ? '<div class="banner warn"><b>' + flagged.length + ' need' + (flagged.length === 1 ? 's' : '') +
       ' your eyes before writing.</b><br>' + flagged.map((j) =>
         esc(j.company) + ' — ' + esc(j.result.needsHuman
@@ -736,11 +766,11 @@ function renderReview() {
     '<div class="card" style="padding:0"><table><thead><tr>' +
       (basic
         ? '<th style="width:34px"></th><th>Company</th><th>What they are</th><th>Owner / CEO</th>' +
-          '<th class="num">Emp</th><th>HR / applicant system</th><th>HQ</th><th>Owner contact</th><th></th>'
+          '<th class="num">Emp</th><th>HR / applicant system</th><th>HQ</th><th>Owner contact</th><th>Leadership</th><th></th>'
         : '<th style="width:34px"></th><th>Company</th><th>Decision-maker</th>' +
-          '<th class="num">Emp</th><th>Phone</th><th>Likely provider</th>' +
+          '<th class="num">Emp</th><th>Phone</th><th>Leadership</th><th>Likely provider</th>' +
           '<th class="num">2nd contact</th><th></th>') + '</tr></thead><tbody>' +
-    jobs.map(basic ? basicRow : reviewRow).join('') + '</tbody></table></div>' +
+    jobs.map((j) => (basic || j.mode === 'basic' || (j.result && j.result.basic)) ? basicRow(j, !basic) : reviewRow(j)).join('') + '</tbody></table></div>' +
     '<div class="bar-sticky"><button class="btn primary" id="write" disabled>Write 0 to Zoho</button>' +
     '<button class="btn ghost sm" id="approve-all">Approve all clean</button>' +
     '<span class="muted tiny" id="write-note"></span></div>' +
@@ -791,8 +821,24 @@ function syncWrite() {
 const isBasic = (run) => !!(run && run.mode === 'basic');
 const modePill = (run) => isBasic(run) ? '<span class="pill cool">basic</span>' : '<span class="pill ok">comprehensive</span>';
 
-function basicRow(j) {
+function basicRow(j, inFullTable) {
   const r = j.result, b = r.basic || {}, c = r.contact || {};
+  if (inFullTable) {
+    // A fallback lead inside a comprehensive run: fit its facts into that table's columns.
+    const isOpen2 = open.has(j.leadId);
+    const nm = [c.firstName, c.lastName].filter(Boolean).join(' ') || b.ceo || '—';
+    return '<tr>' +
+      '<td>' + (j.written ? '<span class="pill ok">✓</span>' : '<input type="checkbox" data-id="' + esc(j.leadId) + '" ' + (approved.has(j.leadId) ? 'checked' : '') + '/>') + '</td>' +
+      '<td><b>' + esc(j.company) + '</b><br><span class="pill flag">basic fallback</span>' + (!(r.fields && String(r.fields.Description || '').trim()) ? ' <span class="pill bad">no description</span>' : '') + '</td>' +
+      '<td class="tiny">' + esc(nm) + (c.title ? '<br><span class="muted">' + esc(c.title) + '</span>' : '') + (r.contactChanged ? '<br><span class="pill flag">replaced</span>' : '') + '</td>' +
+      '<td class="num tiny">' + (r.employees == null ? '—' : r.employees) + '</td>' +
+      '<td class="tiny">' + esc(c.directPhone || c.mobilePhone || '') + (!c.directPhone && !c.mobilePhone ? '<span class="pill flag">none for the owner</span>' : '') + '</td>' +
+      '<td class="tiny">' + leadershipCell(r) + '</td>' +
+      '<td class="tiny">' + esc(b.hcm ? b.hcm + ' (applicant system)' : '') + '</td>' +
+      '<td class="num tiny">' + ((r.additionalContacts || []).length || '') + '</td>' +
+      '<td><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen2 ? 'hide' : 'open') + '</button></td></tr>' +
+      (isOpen2 ? '<tr><td colspan="9" style="padding:0"><div class="detail">' + basicDetail(j) + '</div></td></tr>' : '');
+  }
   const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || b.ceo || '—';
   const isOpen = open.has(j.leadId);
   const emp = r.employees == null ? (b.employees == null ? '—' : b.employees) : r.employees;
@@ -814,8 +860,9 @@ function basicRow(j) {
     '<td class="tiny">' + esc(b.hcm || '') + '</td>' +
     '<td class="tiny">' + esc(b.hq || '') + (b.execLocation && b.execLocation !== b.hq ? '<br><span class="muted">owners: ' + esc(b.execLocation) + '</span>' : '') + '</td>' +
     '<td class="tiny">' + (reach || '<span class="pill flag">none</span>') + '</td>' +
+    '<td class="tiny">' + leadershipCell(r) + '</td>' +
     '<td><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen ? 'hide' : 'open') + '</button></td></tr>' +
-    (isOpen ? '<tr><td colspan="9" style="padding:0"><div class="detail">' + basicDetail(j) + '</div></td></tr>' : '');
+    (isOpen ? '<tr><td colspan="10" style="padding:0"><div class="detail">' + basicDetail(j) + '</div></td></tr>' : '');
 }
 
 function basicDetail(j) {
@@ -835,10 +882,8 @@ function basicDetail(j) {
     row('Where the owners sit', esc(b.execLocation || '')) +
     row('Owner contact', [c.firstName, c.lastName].filter(Boolean).join(' ') ? esc([c.firstName, c.lastName].filter(Boolean).join(' ')) + (c.title ? ' — ' + esc(c.title) : '') +
       (c.email ? '<br>' + esc(c.email) : '') + (c.directPhone ? '<br>direct ' + esc(c.directPhone) : '') + (c.mobilePhone ? '<br>mobile ' + esc(c.mobilePhone) : '') : '') +
-    row('Other C-suite', (r.additionalContacts || []).map((a) =>
-      esc([a.firstName, a.lastName].filter(Boolean).join(' ')) + (a.title ? ' <span class="muted">' + esc(a.title) + '</span>' : '') +
-      (a.directPhone ? ' · ' + esc(a.directPhone) : '') + (a.email ? ' · ' + esc(a.email) : '') +
-      (a.reason ? ' <span class="pill cool">' + esc(a.reason) + '</span>' : '')).join('<br>')) +
+    row('Leadership roster', leadershipList(r)) +
+    (r.fallback ? row('Why this is a basic profile', '<span style="color:var(--warn)">The full research session was stopped — ' + esc(r.fallback.reason || '') + ' — so the basic pass ran instead. Re-run this lead later for the full profile.</span>') : '') +
     row('Company description', (r.fields && r.fields.Description) ? esc(r.fields.Description) : '<span style="color:var(--bad)">Missing — this field is required on every lead.</span>') +
     ((b.gaps || []).length ? row('Not found', '<span class="muted">' + esc(b.gaps.join(', ')) + ' — one lookup each, no second attempt in basic mode.</span>') : '') +
     (r.needsHuman ? '<dt style="color:var(--warn)">Needs a human</dt><dd>' + esc(r.needsHuman) + '</dd>' : '') +
@@ -865,10 +910,37 @@ function reviewRow(j) {
       ((r.entities || []).length > 1 ? '<br><span class="pill cool">' + (r.entities || []).length + ' entities</span>' : '') + '</td>' +
     '<td class="tiny">' + esc(c.directPhone || c.mobilePhone || '') +
       (!c.directPhone && !c.mobilePhone ? '<span class="pill flag">none for the owner</span>' : '') + '</td>' +
+    '<td class="tiny">' + leadershipCell(r) + '</td>' +
     '<td class="tiny" style="max-width:240px">' + esc((r.fields && r.fields.Current_PR_Provider_new) || '') + '</td>' +
     '<td class="num tiny">' + ((r.additionalContacts || []).length || '') + '</td>' +
     '<td><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen ? 'hide' : 'open') + '</button></td></tr>' +
-    (isOpen ? '<tr><td colspan="8" style="padding:0"><div class="detail">' + detail(j) + '</div></td></tr>' : '');
+    (isOpen ? '<tr><td colspan="9" style="padding:0"><div class="detail">' + detail(j) + '</div></td></tr>' : '');
+}
+
+// The leadership roster: everyone at the top of the company the research could
+// name, and how many of them have a number. This is the column a rep scans first.
+function rosterOf(r) {
+  const seen = {}; const out = [];
+  const add = (p, primary) => {
+    if (!p) return; const name = [p.firstName, p.lastName].filter(Boolean).join(' ');
+    if (!name || seen[name.toLowerCase()]) return; seen[name.toLowerCase()] = 1;
+    out.push({ name, title: p.title || '', phone: p.directPhone || p.mobilePhone || '', mobile: p.directPhone && p.mobilePhone ? p.mobilePhone : '', email: p.email || '', primary: !!primary, dnc: !!(p.directPhoneDNC || p.mobilePhoneDNC) });
+  };
+  add(r.contact, true); (r.leadership || []).forEach((p) => add(p)); (r.additionalContacts || []).forEach((p) => add(p));
+  return out;
+}
+function leadershipCell(r) {
+  const ros = rosterOf(r); const withPhone = ros.filter((p) => p.phone).length;
+  if (!ros.length) return '<span class="pill flag">nobody named</span>';
+  return '<b>' + withPhone + '</b><span class="muted"> of ' + ros.length + ' with a number</span>' +
+    (withPhone === 0 ? '<br><span class="pill flag">no phones</span>' : '');
+}
+function leadershipList(r) {
+  const ros = rosterOf(r);
+  return ros.map((p) => '<div>' + esc(p.name) + (p.title ? ' <span class="muted">' + esc(p.title) + '</span>' : '') +
+    (p.phone ? ' · ' + esc(p.phone) : '') + (p.mobile ? ' · ' + esc(p.mobile) : '') + (p.email ? ' · ' + esc(p.email) : '') +
+    (p.primary ? ' <span class="pill ok">primary</span>' : '') + (p.dnc ? ' <span class="pill bad">DNC</span>' : '') +
+    (!p.phone ? ' <span class="pill flag">no number</span>' : '') + '</div>').join('') || '—';
 }
 
 // What actually landed in the CRM, in the words Zoho used. A half-written record
@@ -916,6 +988,7 @@ function detail(j) {
       ? esc(r.fields.Description).replace(/\n/g, '<br>')
       : '<span style="color:var(--bad)">Missing — this field is required on every lead.</span>') + '</dd>' +
     '<dt>Likely provider</dt><dd>' + esc((r.fields && r.fields.Current_PR_Provider_new) || '—') + '</dd>' +
+    '<dt>Leadership roster</dt><dd>' + leadershipList(r) + '<div class="muted tiny" style="margin-top:4px">Written to the record as a LEADERSHIP CONTACTS note; the two additional-contact slots are filled from it when the profile left them empty.</div></dd>' +
     '<dt>Additional contacts</dt><dd>' + ((r.additionalContacts || []).map((a) =>
       esc([a.firstName, a.lastName].filter(Boolean).join(' ')) +
       (a.title ? ' <span class="muted">' + esc(a.title) + '</span>' : '') +
@@ -983,6 +1056,8 @@ function renderStats() {
       (s.byMode && s.byMode.basic && s.byMode.basic.leads
         ? tile(s.byMode.basic.leads, 'basic profiles', '$' + s.byMode.basic.avgCost.toFixed(2) + ' each vs $' + ((s.byMode.full || {}).avgCost || 0).toFixed(2) + ' for a full profile \u00b7 ' + s.byMode.basic.written + ' written') : '') +
       tile(s.disqualified, 'disqualified', 'Dissolved, already a client, or under a PEO') +
+      tile((s.avgLeadershipPhones || 0).toFixed(1), 'leadership phones per lead', (s.leadershipPhones || 0) + ' executives with a number across every profile') +
+      (s.fallbacks ? tile(s.fallbacks, 'fell back to basic', 'Full sessions stopped by a cap and replaced with a basic pass') : '') +
     '</div>' +
     peopleHtml +
 
@@ -999,11 +1074,11 @@ function renderStats() {
     '</div></div>' +
 
     '<h2>Recent runs</h2><div class="card" style="padding:0"><table>' +
-    '<thead><tr><th>Run</th><th>Type</th><th>Who</th><th>When</th><th class="num">Leads</th><th class="num">Done</th><th class="num">Written</th></tr></thead><tbody>' +
+    '<thead><tr><th>Run</th><th>Type</th><th>Who</th><th>When</th><th class="num">Leads</th><th class="num">Done</th><th class="num">Failed</th><th class="num">Fell back</th><th class="num">Written</th><th class="num">Cost</th></tr></thead><tbody>' +
     s.recentRuns.map((r) => '<tr><td class="tiny">' + esc(r.id) + '</td><td class="tiny">' + modePill(r) + '</td><td class="tiny">' + esc(r.userName || '—') + '</td>' +
       '<td class="muted tiny">' + new Date(r.at).toLocaleString() + '</td>' +
-      '<td class="num tiny">' + r.n + '</td><td class="num tiny">' + r.done + '</td>' +
-      '<td class="num tiny">' + r.written + '</td></tr>').join('') +
+      '<td class="num tiny">' + r.n + '</td><td class="num tiny">' + r.done + '</td><td class="num tiny">' + (r.failed || '') + '</td><td class="num tiny">' + (r.fallbacks || '') + '</td>' +
+      '<td class="num tiny">' + r.written + '</td><td class="num tiny">' + (r.cost ? '$' + r.cost.toFixed(2) : '') + '</td></tr>').join('') +
     '</tbody></table></div>';
 }
 const tile = (n, l, h) => '<div class="tile"><div class="n">' + n + '</div><div class="l">' + l + '</div><div class="h">' + h + '</div></div>';
@@ -1261,11 +1336,10 @@ function renderSetup() {
     (!p ? '<p class="muted" style="margin:0 0 14px">Not run yet.</p>'
       : p.error ? '<div class="banner bad" style="margin:0 0 14px"><b>Preflight could not complete.</b><br>' + esc(p.error) +
         '<br><span class="muted tiny">Most often this means the Claude CLI is not on PATH. Check the command in Settings below.</span></div>'
-      : line(p.skill, 'zoho-lead-profiler skill', 'the rules this bot runs on') +
-        line(p.zoho, 'Zoho CRM connector', 'where leads come from and go back to') +
-        line(p.zohoLeadsReachable, 'Leads module answers', 'a live read actually succeeded') +
-        line(p.zoominfo, 'ZoomInfo connector', 'first pass on the contact') +
+      : line(p.zoominfo, 'ZoomInfo connector', 'the contact search and the leadership roster' + (p.toolPrefixes && p.toolPrefixes.zoominfo ? ' \u00b7 tools named ' + esc(p.toolPrefixes.zoominfo) + '*' : '')) +
+        line(p.zoho, 'Zoho CRM connector', 'read-only lookups inside a session; writes go direct' + (p.toolPrefixes && p.toolPrefixes.zoho ? ' \u00b7 tools named ' + esc(p.toolPrefixes.zoho) + '*' : '')) +
         line(p.websearch, 'Web search', 'verification and public records') +
+        line(p.webfetch !== false, 'Web fetch', 'company pages, careers pages, social pages') +
         (p.notes ? '<p class="muted tiny" style="margin:12px 0 0">' + esc(p.notes) + '</p>' : '')) +
     '<div class="row" style="margin-top:14px"><button class="btn primary" id="pre-run">Run preflight</button>' +
     '<span class="muted tiny" id="pre-note"></span></div></div>';
@@ -1280,13 +1354,23 @@ function renderSetup() {
   $('#c-max').value = S.config.maxSessions || 6;
   $('#c-cmd').value = S.config.claudeCmd;
   $('#c-model').value = S.config.model || '';
+  if ($('#c-model').value !== (S.config.model || '')) { const o = document.createElement('option'); o.value = S.config.model; o.textContent = S.config.model; $('#c-model').appendChild(o); $('#c-model').value = S.config.model; }
   $('#c-timeout').value = S.config.perLeadTimeoutMin;
+  $('#c-costfull').value = S.config.maxCostFull != null ? S.config.maxCostFull : 6;
+  $('#c-costbasic').value = S.config.maxCostBasic != null ? S.config.maxCostBasic : 0.75;
+  $('#c-callsfull').value = S.config.maxToolCallsFull || 100;
+  $('#c-callsbasic').value = S.config.maxToolCallsBasic || 16;
+  $('#c-idle').value = S.config.idleKillMin || 6;
+  $('#c-fallback').value = S.config.fallbackToBasic === false ? 'false' : 'true';
 }
 $('#c-save').onclick = async () => {
   const r = await api('/api/config', {
     concurrency: Number($('#c-conc').value), basicConcurrency: Number($('#c-bconc').value), basicTimeoutMin: Number($('#c-btimeout').value),
     maxSessions: Number($('#c-max').value), claudeCmd: $('#c-cmd').value,
     model: $('#c-model').value, perLeadTimeoutMin: Number($('#c-timeout').value),
+    maxCostFull: Number($('#c-costfull').value), maxCostBasic: Number($('#c-costbasic').value),
+    maxToolCallsFull: Number($('#c-callsfull').value), maxToolCallsBasic: Number($('#c-callsbasic').value),
+    idleKillMin: Number($('#c-idle').value), fallbackToBasic: $('#c-fallback').value === 'true',
     pepm: Number($('#pepm').value) || S.config.pepm,
   });
   S.config = r.config; $('#c-note').textContent = 'Saved.';
