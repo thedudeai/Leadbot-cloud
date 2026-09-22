@@ -42,15 +42,18 @@ four direct dials beats one perfect paragraph. The ZoomInfo calls to build it ar
 on every lead, not only when the primary is unreachable:
 
 ```
-mcp__claude_ai_ZoomInfo__search_contacts_v2(companyName or companyIdList, managementLevelList: ["Owner", "C Level Exec"],
-  sort: "-contactAccuracyScore", pageSize: 10)            // owners file separately from C-level — always ask for both
-mcp__claude_ai_ZoomInfo__enrich_contacts(contacts: [up to 10 of them], requiredFields: ["firstName","lastName","jobTitle",
+mcp__claude_ai_ZoomInfo__search_contacts(companyName or companyWebsite or companyIdList, managementLevelList: ["C Level Exec", "VP Level Exec"],
+  sort: "-contactAccuracyScore", pageSize: 10)            // "Owner" is not a valid level — owners carry C-level titles in ZoomInfo
+mcp__claude_ai_ZoomInfo__enrich_contacts(contacts: [{personId} × up to 10], requiredFields: ["firstName","lastName","jobTitle",
   "managementLevel","email","phone","mobilePhone","directPhoneDoNotCall","mobilePhoneDoNotCall","contactAccuracyScore",
-  "externalUrls","lastUpdatedDate"])                      // one batched call, never one per person
+  "externalUrls","lastUpdatedDate"])                      // one batched call, never one per person; without requiredFields there are NO phones
+mcp__claude_ai_ZoomInfo__enrich_companies(companies: [{companyName, companyWebsite}], requiredFields: ["name","website","employeeCount",
+  "employeeRange","street","city","state","zipCode","phone","locationCount","ultimateParentName","parentName","type","description"])
 ```
 
 Never combine `jobTitleList` with `managementLevelList` — they intersect to zero and fail silently.
-If the ZoomInfo search returns fewer than two people, add `"VP Level Exec"` once. The company's own
+If the ZoomInfo search returns fewer than two people, run it once more with `jobTitleList: ["Owner","Founder","Partner","Principal","Administrator"]` and no management level.
+If a ZoomInfo call errors on a parameter or a tool name, fix it and send it once more — an error is not an empty result. The company's own
 team or leadership page is the other source, and it outranks ZoomInfo on titles and direct lines.
 
 **Ranking the primary**: the highest-priority person on the roster. If the person already on the

@@ -170,14 +170,16 @@ WebSearch: "{co}" {st} secretary of state officers OR registered agent
 ```
 
 ```
-mcp__ZoomInfo__search_contacts_v2(companyIdList: [...],
-  managementLevelList: ["C Level Exec", "Owner"],       // owners are their own level, not C-suite
+mcp__ZoomInfo__search_contacts(companyIdList: [...],
+  managementLevelList: ["C Level Exec", "VP Level Exec"],   // "Owner" is not a level ZoomInfo accepts
   requiredFieldsList: ["mobilePhone"], sort: "-contactAccuracyScore", pageSize: 25)
 ```
 
-**Ask for owners explicitly.** ZoomInfo files owners, founders and partners separately from C-level
-executives, so a C-level-only filter returns the hired CEO and silently hides the person we actually
-want. If the org's allowed values differ, pull one page per level rather than narrowing to C-suite.
+**Owners come back under C-level titles.** The accepted management levels are Board Member, C Level
+Exec, VP Level Exec, Director, Manager and Non Manager — "Owner" errors the call. Owners, founders
+and partners almost always carry a C-level title in ZoomInfo, so this search returns them. If it
+returns fewer than two people, run it once more with `jobTitleList: ["Owner", "Founder", "Partner",
+"Principal", "Administrator"]` and no management level.
 
 **Never combine `jobTitleList` with `managementLevelList`** — they intersect to zero and fail
 silently, which reads as "this company has no executives." Filter by level, then rank by title

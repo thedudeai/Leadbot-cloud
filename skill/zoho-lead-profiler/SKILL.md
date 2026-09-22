@@ -234,15 +234,18 @@ this person?** See the rule immediately below.
 real person worth keeping, just not the primary. Search the company for the owner or CEO:
 
 ```
-mcp__ZoomInfo__search_contacts_v2(companyIdList: [...],
-  managementLevelList: ["C Level Exec", "Owner"],      // owners file separately from C-suite
+mcp__ZoomInfo__search_contacts(companyIdList: [...],
+  managementLevelList: ["C Level Exec", "VP Level Exec"],   // "Owner" is not a level ZoomInfo accepts
   requiredFieldsList: ["mobilePhone"], sort: "-contactAccuracyScore", pageSize: 25)
 ```
 
-**Ask for owners explicitly.** ZoomInfo files owners, founders and partners separately from C-level
-executives, so a C-level-only filter returns the hired CEO and silently hides the person we actually
-want. **Never combine `jobTitleList` with `managementLevelList`** — they intersect to zero and fail
-silently, which reads as "this company has no executives" when it means "you asked wrong."
+**Owners come back under C-level titles.** The accepted management levels are Board Member, C Level
+Exec, VP Level Exec, Director, Manager and Non Manager — "Owner" errors the call. Owners, founders
+and partners almost always carry a C-level title in ZoomInfo, so the search above returns them; if it
+returns fewer than two people, run it once more with `jobTitleList: ["Owner", "Founder", "Partner",
+"Principal", "Administrator"]` and no management level. **Never combine `jobTitleList` with
+`managementLevelList`** — they intersect to zero and fail silently, which reads as "this company has
+no executives" when it means "you asked wrong."
 
 Rank what comes back by the priority table and make the top person the primary. **The person who was
 on the record moves into an additional-contact block** (Step 5) — they are not deleted, just demoted,

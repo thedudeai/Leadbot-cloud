@@ -364,7 +364,7 @@ the field map are in `zoho-writeback.md`. The queries:
 WebFetch  {domain}/team  /leadership  /contact
 WebSearch: "{co}" CFO OR controller OR "vice president" OR "general manager" {st}
 WebSearch: "{co}" "director of operations" OR "office manager" contact
-mcp__ZoomInfo__search_contacts_v2(companyIdList: [...],
+mcp__ZoomInfo__search_contacts(companyIdList: [...],
   managementLevelList: ["C Level Exec", "VP Level Exec", "Director"],
   requiredFieldsList: ["phone"], sort: "-contactAccuracyScore", pageSize: 25)
 ```
