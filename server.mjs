@@ -1570,9 +1570,20 @@ function toolPrefixes() {
   const t = (state.preflight && state.preflight.toolPrefixes) || {};
   return { zoominfo: t.zoominfo || DEFAULT_TOOL_PREFIX.zoominfo, zoho: t.zoho || DEFAULT_TOOL_PREFIX.zoho };
 }
+// ZoomInfo renamed search_contacts_v2 to search_contacts (the list-style parameters
+// were folded into the one tool). Prompts are written with the current name; if
+// preflight saw only the old one on this server, the prompts are rewritten to it.
+function zoominfoSearchTool() {
+  const tools = (state.preflight && Array.isArray(state.preflight.zoominfoTools)) ? state.preflight.zoominfoTools : [];
+  if (tools.includes('search_contacts_v2') && !tools.includes('search_contacts')) return 'search_contacts_v2';
+  return 'search_contacts';
+}
 function applyToolNames(text) {
   const p = toolPrefixes();
-  return String(text).split(DEFAULT_TOOL_PREFIX.zoominfo).join(p.zoominfo).split(DEFAULT_TOOL_PREFIX.zoho).join(p.zoho);
+  let out = String(text).split(DEFAULT_TOOL_PREFIX.zoominfo).join(p.zoominfo).split(DEFAULT_TOOL_PREFIX.zoho).join(p.zoho);
+  const search = zoominfoSearchTool();
+  if (search !== 'search_contacts') out = out.replace(new RegExp(`${p.zoominfo}search_contacts(?![A-Za-z0-9_])`, 'g'), `${p.zoominfo}${search}`);
+  return out;
 }
 
 // The output contracts. Loose on purpose (additionalProperties stays open, almost
@@ -1647,11 +1658,12 @@ const PREFLIGHT_PROMPT = `You are running a one-shot capability check for a dash
 Do exactly this, in one or two messages:
 1. Call ToolSearch twice, in one message: once with the query "zoominfo" and once with the query "zoho". Read the EXACT full tool names that come back (they look like mcp__<server>__<tool>).
 2. From those names, work out the prefix for the ZoomInfo tools (everything up to and including the second "__", e.g. "mcp__claude_ai_ZoomInfo__") and the prefix for the Zoho CRM tools. If a family is absent, use null.
-3. Do not call any Zoho or ZoomInfo tool. Do not call WebSearch. Report whether WebSearch and WebFetch are in your tool list.
+3. List EVERY ZoomInfo tool name you saw, without the prefix, exactly as spelled (e.g. "search_contacts", "enrich_contacts", "enrich_companies"). The dashboard uses this list to address the tools, so spelling matters.
+4. Do not call any Zoho or ZoomInfo tool. Do not call WebSearch. Report whether WebSearch and WebFetch are in your tool list.
 
 Output ONLY a fenced json block, no prose:
 \`\`\`json
-{"zoho": true, "zoominfo": true, "websearch": true, "webfetch": true, "toolPrefixes": {"zoominfo": "mcp__claude_ai_ZoomInfo__", "zoho": "mcp__claude_ai_Zoho_CRM__"}, "zoominfoTools": ["enrich_contacts", "search_contacts_v2"], "notes": "one short line on anything missing"}
+{"zoho": true, "zoominfo": true, "websearch": true, "webfetch": true, "toolPrefixes": {"zoominfo": "mcp__claude_ai_ZoomInfo__", "zoho": "mcp__claude_ai_Zoho_CRM__"}, "zoominfoTools": ["search_contacts", "enrich_contacts", "enrich_companies"], "notes": "one short line on anything missing"}
 \`\`\``;
 const PREFLIGHT_SCHEMA = {
   type: 'object',
@@ -1737,7 +1749,7 @@ ${leadBlock(lead)}
 THE JOB: verify the contact and settle who the top decision-maker is; build the leadership roster with phone numbers; research the company through the four rounds; write the Description, the notes and the icebreakers. No scoring of any kind — no fit score, tier, temperature, confidence rating or deal value. Report facts, sources and dates and let the rep judge.
 
 WORK EFFICIENTLY — these rules cut cost, never depth:
-- Start with ONE ToolSearch call that loads every tool you will need at once: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_contacts,mcp__claude_ai_ZoomInfo__search_contacts_v2,mcp__claude_ai_ZoomInfo__search_scoops,mcp__claude_ai_ZoomInfo__enrich_intent,mcp__claude_ai_Zoho_CRM__searchRecords". Never load tools one at a time. Do not read any file, run any command or list any directory — everything you need is in this message.
+- Start with ONE ToolSearch call that loads every tool you will need at once: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_contacts,mcp__claude_ai_ZoomInfo__search_contacts,mcp__claude_ai_ZoomInfo__enrich_companies,mcp__claude_ai_ZoomInfo__search_scoops,mcp__claude_ai_Zoho_CRM__searchRecords". If that select comes back with any ZoomInfo tool missing, make ONE keyword ToolSearch for "zoominfo" and use the names it returns; the ZoomInfo steps are not optional. Never load tools one at a time. Do not read any file, run any command or list any directory — everything you need is in this message.
 - Fire each research round as ONE message containing ALL of that round's tool calls in parallel. Never issue calls one at a time when they do not depend on each other's results.
 - Write NO commentary between tool calls — no narration, no summaries of what came back. Every extra turn re-reads the whole conversation and is the main cost of this run. Hold everything for the final JSON.
 - A met completion-bar item never earns another call. When the bar is met, return the JSON immediately.
@@ -1808,18 +1820,18 @@ ${leadBlock(lead)}
 
 THE SIX FACTS AND THE ONE WAY TO GET EACH:
 1. WHAT THEY ARE — nursing home, home care agency, manufacturer, charter school, etc. Method: the company website home page (WebFetch). No website on record: ONE WebSearch for "${lead.company}" ${lead.state || ''} and use the first result that is clearly them.
-2. OWNERSHIP AND THE LEADERSHIP ROSTER — who owns it (a single owner, partners, a family, a private-equity group, a public company, a nonprofit board) and every owner and C-level person you can name: CEO, President, CFO, COO, other chiefs. Method: ONE ZoomInfo contact search on the company (mcp__claude_ai_ZoomInfo__search_contacts_v2 with managementLevelList ["Owner", "C Level Exec"], up to 10 rows). If the website has an about or leadership page and you already fetched the site, read the names off that too, but do not go looking for more.
-3. EMPLOYEE COUNT — Method: ONE ZoomInfo company enrichment (mcp__claude_ai_ZoomInfo__enrich_companies) for the headline count. Two special cases:
+2. OWNERSHIP AND THE LEADERSHIP ROSTER — who owns it (a single owner, partners, a family, a private-equity group, a public company, a nonprofit board) and every owner and C-level person you can name: CEO, President, CFO, COO, other chiefs. Method: ONE ZoomInfo contact search on the company — mcp__claude_ai_ZoomInfo__search_contacts with companyName "${lead.company}"${lead.website ? ` (or companyWebsite "${lead.website}")` : ''}, managementLevelList ["C Level Exec", "VP Level Exec"], sort "-contactAccuracyScore", pageSize 10. "Owner" is NOT a valid management level; owners, founders, partners and principals usually carry a C-level title in ZoomInfo and this search returns them. Do not pass jobTitleList together with managementLevelList. Keep the personId of every row — fact 6 needs them. If the website has an about or leadership page and you already fetched the site, read the names off that too, but do not go looking for more.
+3. EMPLOYEE COUNT — Method: ONE ZoomInfo company enrichment — mcp__claude_ai_ZoomInfo__enrich_companies with companies [{ companyName "${lead.company}"${lead.website ? `, companyWebsite "${lead.website}"` : ''} }] and requiredFields ["name","website","employeeCount","employeeRange","street","city","state","zipCode","phone","locationCount","ultimateParentName","parentName","type","description","socialMediaUrls"]. Without requiredFields the tool returns no headcount and no address, so always pass that list. Two special cases:
    - HOME CARE / HOME HEALTH / STAFFING: the ZoomInfo number is usually the office and the real workforce is in the field. Do ONE extra WebSearch: "${lead.company}" caregivers OR aides OR nurses OR employees — and if the company or a news item states a field-staff figure, report office and field separately.
    - NURSING HOME / ASSISTED LIVING / ANY MULTI-FACILITY GROUP: count the whole group. Do ONE extra WebSearch: "${lead.company}" facilities OR locations OR "skilled nursing" — and report the number of facilities and the group-wide headcount (sum the facilities if a per-facility figure is what you find, and say it is a sum).
 4. HCM / HRIS / ATS — what system their job applications run on. Method: fetch the careers or jobs page (WebFetch the careers link from the home page, or {website}/careers) and read the host of the apply links. myworkdayjobs.com = Workday, greenhouse.io = Greenhouse, lever.co = Lever, icims.com = iCIMS, ultipro.com or ukg.com = UKG, paylocity.com = Paylocity, paycomonline.net = Paycom, paycor.com = Paycor, adp.com or workforcenow = ADP, bamboohr.com = BambooHR, applytojob.com = JazzHR, jobvite.com = Jobvite, smartrecruiters.com = SmartRecruiters, ashbyhq.com = Ashby, workable.com = Workable, isolvedhire or isolved = isolved, apploi.com = Apploi, hireology.com = Hireology, indeed-hosted or a plain email/web form = none. If there is no careers page, ONE WebSearch: site:indeed.com OR site:linkedin.com/jobs "${lead.company}" and read the apply destination of one posting. For a multi-facility group, check a second facility's posting if it is right there in the results; do not tour every facility.
 5. HQ AND WHERE THE OWNERS SIT — the headquarters address (from the same ZoomInfo company enrichment as fact 3) and, if the owners or executives sit somewhere else (common with nursing home groups whose owners are in New York or New Jersey while the facilities are elsewhere), that city and state from the ZoomInfo contact rows in fact 2.
-6. PHONE NUMBERS AND EMAIL FOR THE LEADERSHIP — direct phone, mobile and email for the owner/CEO and every other owner or C-level person from fact 2, up to ten people. Method: ONE mcp__claude_ai_ZoomInfo__enrich_contacts call for all of them in one batch, requesting firstName, lastName, jobTitle, email, phone, mobilePhone, directPhoneDoNotCall, mobilePhoneDoNotCall, externalUrls. Take what it returns; do not go hunting elsewhere. Phone numbers are the strongest part of this product: a roster with numbers is the point of this pass.
+6. PHONE NUMBERS AND EMAIL FOR THE LEADERSHIP — direct phone, mobile and email for the owner/CEO and every other owner or C-level person from fact 2, up to ten people. Method: ONE mcp__claude_ai_ZoomInfo__enrich_contacts call for all of them in one batch — contacts [{ personId }, …] from the fact 2 rows (or { firstName, lastName, companyName } for a person named only on the website), and requiredFields ["firstName","lastName","jobTitle","managementLevel","email","phone","mobilePhone","directPhoneDoNotCall","mobilePhoneDoNotCall","contactAccuracyScore","externalUrls"]. Without requiredFields the tool returns names and emails only — no phone numbers — so always pass that list. "phone" is the direct dial. Take what it returns; do not go hunting elsewhere. Phone numbers are the strongest part of this product: a roster with numbers is the point of this pass.
 
 WORK EFFICIENTLY — the budget is the point of this mode:
-- Start with ONE ToolSearch: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_companies,mcp__claude_ai_ZoomInfo__search_contacts_v2,mcp__claude_ai_ZoomInfo__enrich_contacts". Never load tools one at a time. Do not read any file, run any command or list any directory.
+- Start with ONE ToolSearch: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_companies,mcp__claude_ai_ZoomInfo__search_contacts,mcp__claude_ai_ZoomInfo__enrich_contacts". If any ZoomInfo tool is missing from what comes back, spend ONE more ToolSearch on the keyword "zoominfo" and use the exact names it returns — facts 2, 3, 5 and 6 all depend on ZoomInfo, and a basic profile without the roster and its phone numbers has failed. Never load tools one at a time. Do not read any file, run any command or list any directory.
 - Round 1, all in ONE message: the website fetch, the ZoomInfo company enrichment, and the ZoomInfo contact search. Round 2, all in ONE message: the careers page fetch, the contact enrichment batch, and whichever single extra WebSearch fact 3 or fact 4 calls for. That is normally the whole job.
-- HARD CEILING: TWELVE tool calls including the ToolSearch. The server kills the session at ${wall} calls or $${config.maxCostBasic}, and a killed session returns nothing. If a method comes up empty, record the gap and move on. There is no escalation ladder in this mode and no second method for anything.
+- HARD CEILING: TWELVE tool calls including the ToolSearch. The server kills the session at ${wall} calls or $${config.maxCostBasic}, and a killed session returns nothing. If a method comes up empty, record the gap and move on. There is no escalation ladder in this mode and no second method for anything. The one exception: if a ZoomInfo call ERRORS (bad parameter, unknown tool name), fix the call and send it once more — an error is not an empty result, and a roster with no numbers because a parameter was misspelled is a failed profile. Put the reason for any ZoomInfo gap in "gaps" in words (e.g. "zoominfo: search_contacts tool not available"), so the dashboard can tell a real gap from a broken connector.
 - No commentary between tool calls. No narration. Hold everything for the final JSON.
 
 OUTPUT: your final answer is the JSON object below and nothing else (the structured output):
