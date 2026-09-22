@@ -16,7 +16,11 @@ COPY --chown=leadbot:leadbot skill ./skill
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Persistent storage (users, history, runs, zoho.json) lives on a volume mounted here.
+# CLAUDE_CONFIG_DIR puts Claude Code's own state on the same volume: its MCP server
+# list and the OAuth logins for those servers. That is what lets a one-time
+# `claude mcp login zoominfo` on the box survive redeploys.
 ENV DATA_DIR=/data \
+    CLAUDE_CONFIG_DIR=/data/claude \
     PORT=8080 \
     NODE_ENV=production \
     DISABLE_AUTOUPDATER=1 \

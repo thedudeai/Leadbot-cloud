@@ -4,6 +4,6 @@
 # privileges for the real process (Claude Code refuses to bypass permissions as root).
 set -e
 DIR="${DATA_DIR:-/data}"
-mkdir -p "$DIR"
+mkdir -p "$DIR" "${CLAUDE_CONFIG_DIR:-$DIR/claude}"
 chown -R leadbot:leadbot "$DIR"
 exec setpriv --reuid=leadbot --regid=leadbot --init-groups "$@"

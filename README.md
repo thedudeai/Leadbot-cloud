@@ -112,6 +112,43 @@ confirms the server's Claude account can see the skill files, the Zoho and ZoomI
 WebSearch. Then **Team** to add people and map each one to their Zoho user (matched by email
 automatically when the emails line up).
 
+### ZoomInfo on the server (one-time)
+
+The server signs into Claude with `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. That token
+can only make model requests: it cannot fetch the claude.ai connectors, so the ZoomInfo connector
+on the company's Claude account never reaches the headless CLI, and every profile reports that
+ZoomInfo was unavailable. MCP servers configured locally on the box do work, so ZoomInfo is
+registered as a local HTTP MCP server and signed into once.
+
+Claude Code keeps its MCP server list and those OAuth logins in `CLAUDE_CONFIG_DIR`, which the
+Dockerfile points at `/data/claude` on the volume, so the login survives redeploys. Run these once
+from a shell in the running container (`railway ssh`), as the app user with the same home and
+config dir the server uses:
+
+```
+setpriv --reuid=leadbot --regid=leadbot --init-groups env HOME=/home/leadbot CLAUDE_CONFIG_DIR=/data/claude \
+  claude mcp add --transport http -s user zoominfo https://mcp.zoominfo.com/mcp
+
+setpriv --reuid=leadbot --regid=leadbot --init-groups env HOME=/home/leadbot CLAUDE_CONFIG_DIR=/data/claude \
+  claude mcp login zoominfo --no-browser
+```
+
+The login prints an authorization URL. Open it in a browser, sign in to ZoomInfo, and paste the
+final redirect URL (it starts with `http://localhost` and will not load in the browser; the code is
+in the address) back into the waiting prompt. Then check it took:
+
+```
+setpriv --reuid=leadbot --regid=leadbot --init-groups env HOME=/home/leadbot CLAUDE_CONFIG_DIR=/data/claude \
+  claude mcp list
+ls -la /data/claude
+```
+
+`zoominfo` should show as connected and `/data/claude` should hold `.claude.json` and
+`.credentials.json` owned by `leadbot`. Finish with **Setup → Run preflight**: `zoominfo` should be
+true, the ZoomInfo prefix `mcp__zoominfo__` (the local server's name, not the desktop's
+`mcp__claude_ai_ZoomInfo__`), and the tool list should include `search_contacts`,
+`enrich_contacts` and `enrich_companies`.
+
 ## Security notes
 
 Passwords are scrypt-hashed with per-user salts. Sessions are HttpOnly, SameSite=Lax cookies
