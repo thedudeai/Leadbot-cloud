@@ -11,7 +11,7 @@ a login in front of it so the whole payroll team can use one deployment.
 |---|---|---|
 | Who can use it | whoever sits at that PC | anyone with an account; admin creates accounts under **Team** |
 | Which leads a person sees | everything | reps are pinned to the leads they own in Zoho; admins (or anyone marked "sees all") browse the whole org |
-| Runs and Review | one global run | each person has their own run, live feed and Review; restored from disk after a restart |
+| Runs and Review | one global run | each person has their own run and live feed; Review is a queue of every unwritten result across their runs, restored from disk after a restart |
 | Claude sessions | 3 at a time | per-person cap (default 3) **and** a company-wide cap (default 6) so five reps can't fire off fifteen sessions |
 | Stats | one machine | "My runs" for everyone, "Everyone" with a by-person table for admins |
 | Claude sign-in | the PC's `claude login` | `CLAUDE_CODE_OAUTH_TOKEN` in the server environment — one shared company account |
@@ -76,6 +76,20 @@ confirm; Zoho API calls time out at 30 s instead of hanging a write forever; a c
 no longer takes the run down; stopped sessions get an estimated cost from their token usage
 (marked *est.*) so Stats stops under-counting them; `config.json` from an earlier version gets the
 new defaults and `model` is migrated from '' (the CLI's priciest default) to `sonnet`.
+
+## Review is a queue (23 Sep 2026)
+
+Review used to show the latest run only: starting another run replaced it, and a restart brought
+back just the most recent one. It is now a queue. Every profiled result from every run stays in
+Review until someone **writes** it to Zoho or **removes** it (the `remove` link on a row; the
+research stays in the run history and the lead can be profiled again). Rows are grouped under a
+heading per run, newest run first, and the Review badge counts what is waiting. Approving rows
+from several runs and writing them in one go is fine. A lead profiled again replaces its older
+waiting result, so a lead never appears twice. After a restart the server rebuilds every run
+that still has something waiting (up to the last hundred), plus the latest run for the Run
+screen, from `history.json` and the result files on the volume. `GET /api/state` carries the
+queue as `review`; `POST /api/review/discard { leadIds }` removes rows; `review` events on the
+stream push every change.
 
 ## Nothing runs unless it can finish (23 Sep 2026)
 
