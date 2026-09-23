@@ -23,12 +23,17 @@ for (let i = 0; i < 40; i++) { try { if ((await fetch(BASE + '/healthz')).ok) br
 
 const browser = await chromium.launch();
 const errors = [];
+// A failed check must not leave the server (and its port) behind for the next run.
+process.on('uncaughtException', (e) => { console.error(e); try { child.kill(); } catch {} try { zohoStub.close(); } catch {} process.exit(1); });
+process.on('unhandledRejection', (e) => { console.error(e); try { child.kill(); } catch {} try { zohoStub.close(); } catch {} process.exit(1); });
 async function page(who) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const pg = await ctx.newPage();
   pg.on('pageerror', (e) => errors.push(`[${who}] pageerror ${e.message}`));
   pg.on('response', (rs) => { if (rs.status() >= 400) { console.log('  HTTP', rs.status(), rs.request().method(), rs.url(), rs.request().postData(), rs.request().resourceType()); rs.text().then((t) => console.log('    body:', t)).catch(() => {}); } });
   pg.on('console', (m) => { if (m.type() === 'error') errors.push(`[${who}] console ${m.text()}`); });
+  // confirm() dialogs (remove from Review, stop the run) are accepted; prompt() ones are dismissed.
+  pg.on('dialog', (d) => (d.type() === 'confirm' ? d.accept() : d.dismiss()));
   return pg;
 }
 
@@ -85,6 +90,9 @@ await r.click('nav button[data-v="review"]'); await r.waitForSelector('#review-b
 const hdr = await r.textContent('#review-body thead');
 if (!hdr.includes('HR / applicant system') || !hdr.includes('Owner contact')) throw new Error('basic review table not shown: ' + hdr);
 if (!(await r.textContent('#review-body tbody')).includes('Paylocity')) throw new Error('basic row missing HCM');
+// the queue: the full-run result of the same lead was written, so only the basic one waits, under its run heading
+if (await r.locator('#review-body tbody .toggle').count() !== 1) throw new Error('written result of an older run still in the queue');
+if (!(await r.textContent('#review-body')).includes('1 waiting to be written') || !(await r.textContent('#review-body .run-sep')).includes('RUN ')) throw new Error('queue summary or run heading missing');
 await r.click('#review-body .toggle'); await wait(200);
 // the same stub lead was opened during the full run, so the first click may have closed it
 if (!(await r.locator('#review-body .detail').count())) { await r.click('#review-body .toggle'); await wait(200); }
@@ -107,7 +115,13 @@ await r.click('#pw').catch(() => {});
   await r.click('nav button[data-v="run"]');
   await r.waitForSelector('#stop-run', { timeout: 10000 });
   await r.waitForSelector('#live .pill.flag:text-is("fell back to basic")', { timeout: 60000 });
-  await r.waitForSelector('#nb-review:text-is("2")', { timeout: 30000 });
+  try { await r.waitForSelector('#nb-review:text-is("2")', { timeout: 30000 }); }
+  catch (e) {
+    const st = await (await r.request.get(BASE + '/api/state')).json();
+    console.log('  DEBUG badge=', await r.textContent('#nb-review'), 'server review=', JSON.stringify(st.review.map((j) => [j.leadId, j.runId, j.status, j.written, j.discarded, !!j.result])),
+      'run jobs=', JSON.stringify(st.run.jobs.map((j) => [j.leadId, j.status, j.discarded, !!j.result, j.mode])));
+    throw e;
+  }
   await r.click('nav button[data-v="review"]'); await r.waitForSelector('#review-body tbody tr');
   const body = await r.textContent('#review-body');
   if (!body.includes('basic fallback') || !body.includes('came back as a basic profile')) throw new Error('fallback row/banner missing');
@@ -118,6 +132,12 @@ await r.click('#pw').catch(() => {});
   if (!det.includes('Leadership roster') || !det.includes('Why this is a basic profile')) throw new Error('detail panels missing roster/fallback rows');
   await r.screenshot({ path: path.join(ROOT, 'test', 'shot-rep-review-fallback.png'), fullPage: true });
   console.log('  fallback lead rendered in review with the leadership column');
+  // remove one from the queue without writing: the badge and the summary follow
+  if ((await r.textContent('#nb-review')) !== '2') throw new Error('review badge should count 2 waiting');
+  await r.locator('#review-body .discard').first().click();
+  await r.waitForSelector('#nb-review:text-is("1")', { timeout: 10000 });
+  if (!(await r.textContent('#review-body')).includes('1 waiting to be written')) throw new Error('queue summary did not update after remove');
+  console.log('  remove took a result out of the queue');
   await a.click('nav button[data-v="setup"]'); await wait(200);
   if ((await a.inputValue('#c-model')) !== 'sonnet' || (await a.inputValue('#c-costfull')) !== '6') throw new Error('setup hard-stop fields not populated');
   console.log('  setup shows model + hard stops');

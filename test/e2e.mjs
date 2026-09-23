@@ -88,6 +88,8 @@ s = await pollRun('rep', (x) => x.run.jobs.find((j) => j.leadId === '5001').writ
 assert.equal(s.run.jobs.find((j) => j.leadId === '5002').written, false); ok('only the approved lead was written');
 assert.equal(zohoStub.state.writes.length, 1); assert.equal(zohoStub.state.writes[0].id, '5001'); assert.equal(zohoStub.state.writes[0].First_Name, 'Pat');
 assert.ok(zohoStub.state.notes.some((n) => n.leadId === '5001' && n.Note_Title === 'PAYROLL FINDINGS')); ok('…and it landed in the CRM as a field update plus notes');
+const reviewIds = (st) => st.review.map((j) => j.leadId).sort();
+assert.deepEqual(reviewIds(s), ['5001', '5002']); assert.equal(s.review.find((j) => j.leadId === '5001').written, true); ok('review queue: the written lead still shows its tick, the other waits');
 
 // 5a. Hard stops and the fallback ladder
 r = await call('rep', '/api/run', { leads: [{ id: '5501', company: 'Runaway Inc', owner: { id: '999' } }, { id: '5502', company: 'Gamma LLC', owner: { id: '999' } }] });
@@ -99,7 +101,17 @@ s = await pollRun('rep', (x) => x.run && x.run.id === runawayRun && x.run.finish
   assert.equal(j.mode, 'basic'); assert.equal(j.result.basic.hcm, 'Paylocity'); assert.equal(j.attempts.length, 2); assert.equal(j.attempts[0].stopped, 'used more than 25 tool calls'); ok('…and the lead came back as a basic-profile fallback');
   assert.equal(s.run.jobs.find((x) => x.leadId === '5502').status, 'done'); ok('the other lead in the run was unaffected');
   const h = await fetch(BASE + '/healthz').then((x) => x.json()); assert.equal(h.liveSessions, 0); assert.equal(h.liveProcesses, 0); ok('no session slot or process leaked after the kill');
+  // The queue: the unwritten lead from the first run is still in Review, the written one is not.
+  assert.deepEqual(reviewIds(s), ['5002', '5501', '5502']); ok('review queue keeps the earlier run\'s unwritten lead alongside the new run');
+  assert.equal(s.review[0].runId, runawayRun); assert.equal(s.review.find((x) => x.leadId === '5002').runId, runId); ok('…newest run first, each row tagged with its run');
 }
+// 5a'. Re-profiling a queued lead replaces its older waiting result; removing a lead takes it out without a write.
+r = await call('rep', '/api/run', { leads: [{ id: '5002', company: 'Beta School', owner: { id: '999' } }] }); assert.equal(r.status, 200); const againRun = r.json.runId;
+s = await pollRun('rep', (x) => x.run && x.run.id === againRun && x.run.finishedAt, 100);
+assert.deepEqual(reviewIds(s), ['5002', '5501', '5502']); assert.equal(s.review.find((x) => x.leadId === '5002').runId, againRun); ok('a lead profiled again appears once, from the newer run');
+assert.equal(JSON.parse(fs.readFileSync(path.join(STORE, 'data', 'history.json'))).runs.find((x) => x.id === runId).jobs.find((j) => j.leadId === '5002').discarded, 'superseded'); ok('…and the older result is marked superseded in history');
+r = await call('rep', '/api/review/discard', { leadIds: ['5501'] }); assert.equal(r.json.removed, 1); assert.deepEqual(r.json.review.map((j) => j.leadId).sort(), ['5002', '5502']); ok('remove takes a result out of the queue');
+r = await call('rep', '/api/write', { leadIds: ['5501'] }); assert.equal(r.status, 400); ok('…and it can no longer be written');
 r = await call('rep', '/api/run', { leads: [{ id: '5601', company: 'Hung Inc', owner: { id: '999' } }, { id: '5602', company: 'Hung Inc', owner: { id: '999' } }, { id: '5603', company: 'Hung Inc', owner: { id: '999' } }, { id: '5604', company: 'Hung Inc', owner: { id: '999' } }] });
 assert.equal(r.status, 200); const hungRun = r.json.runId; ok('run with hung sessions started ' + hungRun);
 await wait(800);
@@ -111,6 +123,7 @@ r = await call('rep', '/api/run', { leads: [{ id: '5701', company: 'Recent Co', 
 assert.equal(r.status, 409); assert.equal(r.json.error, 'recent'); assert.equal(r.json.recent[0].id, '5701'); ok('a lead profiled two days ago is refused without force');
 r = await call('rep', '/api/run', { force: true, leads: [{ id: '5701', company: 'Recent Co', owner: { id: '999' }, profiledDate: '2026-09-14' }] });
 assert.equal(r.status, 200); s = await pollRun('rep', (x) => x.run && x.run.finishedAt, 100); ok('…and accepted with force');
+assert.deepEqual(reviewIds(s), ['5002', '5502', '5701']); ok('review queue now spans three runs');
 
 // 5b. Basic run — wide fan-out, own mode label, own review shape
 r = await call('rep', '/api/run', { mode: 'basic', leads: Array.from({ length: 25 }, (_, i) => ({ id: String(6000 + i), company: 'Basic Co ' + i, owner: { id: '999' } })) });
@@ -118,6 +131,7 @@ assert.equal(r.status, 200); const basicRunId = r.json.runId; ok('rep starts a 2
 s = await pollRun('rep', (x) => x.run && x.run.id === basicRunId && x.run.finishedAt && x.run.jobs.every((j) => j.status === 'done'), 120);
 assert.equal(s.run.mode, 'basic'); assert.equal(s.run.jobs.length, 25); ok('basic run carries mode=basic and finished all 25');
 assert.equal(s.run.jobs[0].result.basic.hcm, 'Paylocity'); assert.equal(s.run.jobs[0].cost, 0.05); ok('basic result shape and cost captured');
+assert.equal(s.review.length, 28); assert.equal(s.review.filter((j) => j.mode === 'full').length, 3); ok('review queue holds the 25 basic results plus the three full ones still waiting');
 assert.equal(JSON.parse(fs.readFileSync(path.join(STORE, 'data', 'history.json'))).runs.find((x) => x.id === basicRunId).mode, 'basic'); ok('mode persisted to history');
 r = await call('rep', '/api/write', { leadIds: ['6000', '6001'] }); assert.equal(r.json.queued, 2); ok('basic results queue for write');
 s = await pollRun('rep', (x) => x.run.jobs.filter((j) => j.written).length === 2);
@@ -127,8 +141,8 @@ assert.equal(r.status, 400); assert.match(r.json.error, /Basic profile/); ok('51
 
 // 6. Stats
 r = await call('rep', '/api/stats?scope=all'); assert.equal(r.status, 403); ok('rep cannot see everyone stats');
-r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 30); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
-assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 4); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
+r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 31); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
+assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 5); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
 r = await call('admin', '/api/stats'); assert.equal(r.json.totalLeads, 0); ok("admin's own stats are separate");
 
 // 6a. The readiness gate: nothing runs while Zoho cannot take the write-back or
@@ -171,7 +185,14 @@ r = await call('rep', '/api/state'); assert.equal(r.status, 200); ok('session co
 assert.equal(r.json.run.id, basicRunId); assert.equal(r.json.run.restored, true); assert.equal(r.json.run.mode, 'basic');
 assert.equal(r.json.run.jobs.find((j) => j.leadId === '6002').result.basic.ceo, 'Sam Roth');
 assert.equal(r.json.run.jobs.find((j) => j.leadId === '6000').written, true); ok('latest (basic) run restored from disk with mode, results and written flags');
-r = await call('rep', '/api/write', { leadIds: ['6002'] }); assert.equal(r.json.queued, 1); ok('unwritten lead from the restored run can still be written');
+{
+  const waiting = r.json.review.filter((j) => !j.written).map((j) => j.leadId).sort();
+  assert.equal(waiting.length, 24); assert.ok(['5002', '5502', '5701', '6002', '6024'].every((id) => waiting.includes(id))); assert.ok(!waiting.includes('5501'));
+  assert.equal(r.json.review.filter((j) => j.written).length, 4); ok('review queue restored across every run: 24 waiting from four runs, the latest run\'s 4 written rows, the removed one gone');
+}
+r = await call('rep', '/api/write', { leadIds: ['6002', '5502'] }); assert.equal(r.json.queued, 2); ok('unwritten leads from two restored runs can still be written together');
+s = await pollRun('rep', (x) => x.review.filter((j) => j.written).length === 5 || x.review.filter((j) => j.leadId === '5502').length === 0);
+assert.ok(zohoStub.state.writes.some((w) => w.id === '5502')); assert.deepEqual(reviewIds(s).filter((id) => id === '5502'), []); ok('…the older run\'s lead landed in Zoho and left the queue');
 
 // 8. Disable / logout
 r = await call('admin', '/api/users/' + rep.id, { enabled: false }); r = await call('rep', '/api/state'); assert.equal(r.status, 401); ok('disabling a user kills their session');

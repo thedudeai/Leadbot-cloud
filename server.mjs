@@ -1999,10 +1999,14 @@ ${STYLE_SECTION}`);
 // Everything else — the browsed lead list, the active run — belongs to one user.
 const state = {
   preflight: readJSON(path.join(DATA, 'preflight.json'), null),
-  perUser: new Map(),   // userId -> { leads, activeSegment, run }
+  perUser: new Map(),   // userId -> { leads, activeSegment, run, runs }
 };
+// `run` is the latest run (the one the Run screen shows live); `runs` is every run
+// of this person that still matters — anything with a result not yet written or
+// removed — oldest first. Review is built from `runs`, so results queue up across
+// runs and restarts until someone writes or removes them.
 function userState(userId) {
-  if (!state.perUser.has(userId)) state.perUser.set(userId, { leads: [], activeSegment: null, run: null });
+  if (!state.perUser.has(userId)) state.perUser.set(userId, { leads: [], activeSegment: null, run: null, runs: [] });
   return state.perUser.get(userId);
 }
 
@@ -2012,16 +2016,21 @@ function newRunId() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-${crypto.randomBytes(2).toString('hex')}`;
 }
 
-// After a restart (deploys, sleeps) nobody's Review should come up empty. The
-// user's most recent run is rebuilt from history plus the result files on the
-// volume, so anything profiled but not yet written is still there to approve.
-function loadRunFromDisk(userId) {
-  const rec = [...history.runs].reverse().find((r) => r.userId === userId);
-  if (!rec) return null;
+// After a restart (deploys, sleeps) nobody's Review should come up empty. Every
+// run of the user that still holds a result nobody has written or removed is
+// rebuilt from history plus the result files on the volume — and the latest run
+// always is, so the Run screen shows where they left off.
+function loadRunsFromDisk(userId) {
+  const mine = history.runs.filter((r) => r.userId === userId);
+  const latest = mine[mine.length - 1];
+  const waiting = (rec) => rec.jobs.some((j) => j.status === 'done' && !j.written && !j.discarded && fs.existsSync(path.join(RUNS, rec.id, `${j.leadId}.json`)));
+  return mine.filter((rec) => rec === latest || waiting(rec)).slice(-100).map(restoreRun);
+}
+function restoreRun(rec) {
   const dir = path.join(RUNS, rec.id);
   return {
-    id: rec.id, userId, startedAt: rec.startedAt, finishedAt: rec.finishedAt || rec.startedAt, pepm: rec.pepm,
-    mode: rec.mode || 'full',
+    id: rec.id, userId: rec.userId, userName: rec.userName, startedAt: rec.startedAt, finishedAt: rec.finishedAt || rec.startedAt, pepm: rec.pepm,
+    mode: rec.mode || 'full', cancelled: rec.cancelled || null,
     restored: true,
     jobs: rec.jobs.map((j) => {
       const result = readJSON(path.join(dir, `${j.leadId}.json`), null);
@@ -2032,11 +2041,41 @@ function loadRunFromDisk(userId) {
         status: j.status === 'running' || j.status === 'queued' ? 'failed' : j.status,
         progress: [], result, error: j.error || (j.status === 'running' || j.status === 'queued' ? 'The server restarted while this lead was in progress.' : null),
         cost: j.cost, toolCalls: j.toolCalls, startedAt: null, finishedAt: null,
-        written: !!j.written, writeResult: j.writeResult || null,
+        written: !!j.written, writeResult: j.writeResult || null, writtenBy: j.writtenBy || null,
+        discarded: j.discarded || null,
       };
     }),
   };
 }
+
+// The review queue: every profiled result across the user's runs that has not been
+// written back or removed, newest run first, plus the written rows of the latest
+// run so a write just made still shows its tick. A lead profiled again replaces
+// its older waiting result (see supersede), so a lead appears once.
+function reviewJobs(us) {
+  const out = [];
+  for (const run of [...us.runs].reverse()) {
+    for (const j of run.jobs) {
+      if (!j.result || j.discarded) continue;
+      if (j.written && run !== us.run) continue;
+      out.push({ ...publicJob(j), runId: run.id, runStartedAt: run.startedAt, runMode: run.mode || 'full', runFinishedAt: run.finishedAt });
+    }
+  }
+  return out;
+}
+// A fresh result for a lead makes the older unwritten one for the same lead
+// obsolete. It is marked rather than deleted, so history still has it.
+function supersede(us, job, run) {
+  const touched = new Set();
+  for (const r of us.runs) {
+    if (r === run) continue;
+    for (const j of r.jobs) {
+      if (j.leadId === job.leadId && j.result && !j.written && !j.discarded) { j.discarded = 'superseded'; touched.add(r); }
+    }
+  }
+  for (const r of touched) persistRun(r);
+}
+const emitReview = (us, userId) => emit('review', { review: reviewJobs(us) }, userId);
 
 async function pool(items, limit, worker) {
   const queue = items.map((item, i) => [i, item]);
@@ -2217,7 +2256,7 @@ async function startRun(user, leads, pepm, mode = 'full') {
   fs.mkdirSync(dir, { recursive: true });
   const us = userState(user.id);
 
-  const run = us.run = {
+  const run = {
     id, userId: user.id, userName: user.name, startedAt: Date.now(), finishedAt: null, pepm, mode,
     cancelled: null,
     jobs: leads.map((l) => ({
@@ -2228,10 +2267,13 @@ async function startRun(user, leads, pepm, mode = 'full') {
       written: false, writeResult: null,
     })),
   };
+  us.run = run;
+  us.runs.push(run);
   // Written to history straight away so a restart mid-run still knows the run
   // existed and who it belonged to.
   persistRun(run);
   emit('run:start', { run: publicRun(run) }, user.id);
+  emitReview(us, user.id);
 
   const limit = basic ? Math.max(1, Number(config.basicConcurrency) || 20) : config.concurrency;
   const worker = async (job) => {
@@ -2255,12 +2297,14 @@ async function startRun(user, leads, pepm, mode = 'full') {
       job.fallback = outcome.fallback || null;
       job.status = 'done';
       try { fs.writeFileSync(path.join(dir, `${job.leadId}.json`), JSON.stringify(outcome.result, null, 2)); } catch {}
+      supersede(us, job, run);
     } else {
       job.status = 'failed';
       job.error = outcome.error || 'Session finished but returned no parseable JSON. Check this lead’s log.';
     }
     persistRun(run);
     emit('job', { job: publicJob(job) }, user.id);
+    if (job.result) emitReview(us, user.id);
   };
   worker.onError = (job, err) => { job.status = 'failed'; job.error = `Profiling crashed: ${err.message}`; job.finishedAt = Date.now(); persistRun(run); emit('job', { job: publicJob(job) }, user.id); };
 
@@ -2309,7 +2353,7 @@ function persistRun(run) {
         industry: j.lead.industry, contact: j.lead.contact, title: j.lead.title, owner: j.lead.owner || null } : null,
       cost: j.cost, costEstimated: !!j.costEstimated, toolCalls: j.toolCalls,
       durationMs: j.finishedAt && j.startedAt ? j.finishedAt - j.startedAt : null,
-      written: j.written, writeResult: j.writeResult || null, error: j.error,
+      written: j.written, writeResult: j.writeResult || null, writtenBy: j.writtenBy || null, discarded: j.discarded || null, error: j.error,
       // No score, tier, confidence or estimated value is kept: the bot does not
       // rate leads any more, so there is nothing of that kind to persist. What is
       // kept instead is coverage — what the research actually managed to find —
@@ -2333,7 +2377,7 @@ function persistRun(run) {
 }
 
 const publicJob = (j) => ({
-  leadId: j.leadId, company: j.company, status: j.status, mode: j.mode || 'full', costEstimated: !!j.costEstimated,
+  leadId: j.leadId, company: j.company, status: j.status, mode: j.mode || 'full', costEstimated: !!j.costEstimated, discarded: j.discarded || null,
   fallback: j.fallback || null, attempts: j.attempts || [],
   progress: j.progress.slice(-40), result: j.result, error: j.error,
   cost: j.cost, toolCalls: j.toolCalls, startedAt: j.startedAt,
@@ -2537,7 +2581,14 @@ const server = http.createServer(async (req, res) => {
     const us = userState(user.id);
     // Restore the last run from the volume the first time this person shows up
     // after a restart, so their Review is where they left it.
-    if (!us.run && !us.restoredOnce) { us.restoredOnce = true; us.run = loadRunFromDisk(user.id); }
+    if (!us.restoredOnce) {
+      us.restoredOnce = true;
+      // Runs started since boot are already in memory; everything else comes off the volume.
+      const live = new Set(us.runs.map((r) => r.id));
+      const restored = loadRunsFromDisk(user.id).filter((r) => !live.has(r.id));
+      us.runs = [...restored, ...us.runs].sort((a, b) => a.startedAt - b.startedAt);
+      if (!us.run) us.run = us.runs[us.runs.length - 1] || null;
+    }
 
     if (p === '/api/logout' && req.method === 'POST') {
       const tok = parseCookies(req).lb_session;
@@ -2583,7 +2634,7 @@ const server = http.createServer(async (req, res) => {
         user: publicUser(user), scope: leadScope(user), admin,
         config: cfg, segments, preflight: state.preflight,
         leads: us.leads, activeSegment: us.activeSegment,
-        run: publicRun(us.run), stats: computeStats({ userId: user.id }),
+        run: publicRun(us.run), review: reviewJobs(us), stats: computeStats({ userId: user.id }),
         liveSessions, readiness,
       });
     }
@@ -2879,11 +2930,30 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, killed });
     }
 
+    if (p === '/api/review/discard' && req.method === 'POST') {
+      // Take a result out of the queue without writing it. History keeps it; the
+      // lead can be profiled again any time.
+      const body = await readBody(req);
+      const ids = new Set(body.leadIds || []);
+      let n = 0;
+      for (const run of us.runs) {
+        let touched = false;
+        for (const j of run.jobs) if (ids.has(j.leadId) && j.result && !j.written && !j.discarded) { j.discarded = `removed by ${user.name}`; touched = true; n++; }
+        if (touched) persistRun(run);
+      }
+      emitReview(us, user.id);
+      return send(res, 200, { removed: n, review: reviewJobs(us) });
+    }
+
     if (p === '/api/write' && req.method === 'POST') {
       const body = await readBody(req);
       const ids = body.leadIds || [];
-      const run = us.run;
-      const jobs = (run?.jobs || []).filter((j) => ids.includes(j.leadId) && j.result && !j.written);
+      // Approved rows can come from any run in the queue, not only the latest.
+      const owner = new Map();
+      for (const run of us.runs) for (const j of run.jobs) {
+        if (ids.includes(j.leadId) && j.result && !j.written && !j.discarded) owner.set(j, run);
+      }
+      const jobs = [...owner.keys()];
       if (!jobs.length) return send(res, 400, { error: 'Nothing approved to write.' });
       // A write that cannot land is refused with the reason rather than attempted:
       // a half-failed batch is far harder to sort out than a paused one.
@@ -2895,8 +2965,9 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, { queued: jobs.length });
 
       const direct = zohoConfigured();
-      const writeLimit = direct ? (run.mode === 'basic' ? 6 : config.concurrency) : Math.min(2, config.concurrency);
+      const writeLimit = direct ? (jobs.every((j) => (j.mode || owner.get(j).mode) === 'basic') ? 6 : config.concurrency) : Math.min(2, config.concurrency);
       pool(jobs, writeLimit, async (job) => {
+        const run = owner.get(job);
         job.status = 'writing';
         emit('job', { job: publicJob(job) }, user.id);
         if (direct) {
@@ -2926,6 +2997,7 @@ const server = http.createServer(async (req, res) => {
         job.status = job.written ? 'written' : 'done';
         persistRun(run);
         emit('job', { job: publicJob(job) }, user.id);
+        emitReview(us, user.id);
       }).catch((err) => {
         emit('status', { msg: `Write-back stopped unexpectedly: ${err.message}` }, user.id);
       });

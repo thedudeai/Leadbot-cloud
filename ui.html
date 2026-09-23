@@ -274,7 +274,7 @@
 
 <section class="view" data-v="review">
   <h1>Review</h1>
-  <p class="sub">Everything the run found, and exactly what it would write. Open a row to read the notes before you approve it. Nothing here has touched Zoho yet.</p>
+  <p class="sub">Everything you have profiled and not yet written back, from every run — results wait here across runs and server restarts until you write them or remove them. Open a row to read the notes before you approve it. Nothing here has touched Zoho yet.</p>
   <div id="review-body"></div>
 </section>
 
@@ -367,7 +367,7 @@ const api = async (p, body) => {
   return r.json();
 };
 
-let S = { config: {}, segments: [], leads: [], run: null, stats: null, preflight: null, readiness: null, user: null, scope: { mapped: true, lockOwner: null }, admin: false };
+let S = { config: {}, segments: [], leads: [], run: null, review: [], stats: null, preflight: null, readiness: null, user: null, scope: { mapped: true, lockOwner: null }, admin: false };
 const isAdmin = () => !!S.admin;
 let chosenSeg = null;
 // Keyed by lead id and holding the whole row, so a selection survives paging,
@@ -434,7 +434,7 @@ function renderNav() {
   const jobs = (S.run && S.run.jobs) || [];
   const done = jobs.filter((j) => j.result).length;
   $('#nb-run').textContent = jobs.length ? done + '/' + jobs.length : (S.leads.length || '—');
-  $('#nb-review').textContent = done;
+  $('#nb-review').textContent = (S.review || []).filter((j) => !j.written).length;
   $('#nb-stats').textContent = (S.stats && S.stats.totalLeads) || 0;
   const p = S.preflight;
   $('#nb-setup').textContent = readyBlocked() ? '!' : !p ? '?' : (p.zoho && p.zoominfo && !p.error) ? '✓' : '!';
@@ -759,19 +759,26 @@ function renderJob(j) {
 /* ---------------------------------------------------------- review */
 function renderReview() {
   const host = $('#review-body');
-  const jobs = ((S.run && S.run.jobs) || []).filter((j) => j.result);
-  if (!jobs.length) { host.innerHTML = '<div class="empty">No results yet. Start a run first.</div>'; return; }
+  // The queue comes from the server: every result across this person's runs that
+  // is not written or removed (newest run first), plus the latest run's written rows.
+  const jobs = (S.review || []).filter((j) => j.result);
+  if (!jobs.length) { host.innerHTML = '<div class="empty">Nothing waiting. Results from every run stay here until you write them or remove them — start a run to add some.</div>'; return; }
 
   // A lead with no company description needs a human before it is written — that
   // field is required and a recent run shipped without it.
-  const basic = isBasic(S.run);
+  const isBasicJob = (j) => j.mode === 'basic' || !!(j.result && j.result.basic);
+  const basic = jobs.every(isBasicJob);
+  const allFull = !jobs.some(isBasicJob);
+  const waiting = jobs.filter((j) => !j.written).length;
+  const runs = new Set(jobs.map((j) => j.runId)).size;
   const noDesc = (j) => !(j.result.fields && String(j.result.fields.Description || '').trim());
   const flagged = jobs.filter((j) => j.result.needsHuman || j.result.contactChanged || noDesc(j));
   const fell = jobs.filter((j) => j.fallback);
   host.innerHTML =
-    '<p class="muted tiny" style="margin:-6px 0 12px">' + modePill(S.run) + ' ' + (basic
-      ? 'Six facts per lead, one lookup each. Writing stamps the record <b>Profile Type: Basic</b> so you can tell it apart from a full profile later.'
-      : 'Full research profile. Writing stamps the record <b>Profile Type: Comprehensive</b>.') + '</p>' +
+    '<p class="muted tiny" style="margin:-6px 0 12px"><b>' + waiting + ' waiting to be written</b> from ' + runs + ' run' + (runs === 1 ? '' : 's') + '. ' + (basic
+      ? '<span class="pill cool">basic</span> Six facts per lead, one lookup each. Writing stamps the record <b>Profile Type: Basic</b> so you can tell it apart from a full profile later.'
+      : allFull ? '<span class="pill ok">comprehensive</span> Full research profile. Writing stamps the record <b>Profile Type: Comprehensive</b>.'
+      : 'Full and basic profiles together — each row writes as its own type, <b>Comprehensive</b> or <b>Basic</b>.') + '</p>' +
     (fell.length ? '<div class="banner warn"><b>' + fell.length + ' lead' + (fell.length === 1 ? '' : 's') + ' came back as a basic profile instead of a full one</b> — the full session was stopped (' +
       fell.map((j) => esc(j.company) + ': ' + esc((j.fallback && j.fallback.reason) || '')).join('; ') + '). They write as <b>Profile Type: Basic</b> and can be re-run later.</div>' : '') +
     (flagged.length ? '<div class="banner warn"><b>' + flagged.length + ' need' + (flagged.length === 1 ? 's' : '') +
@@ -786,7 +793,8 @@ function renderReview() {
         : '<th style="width:34px"></th><th>Company</th><th>Decision-maker</th>' +
           '<th class="num">Emp</th><th>Phone</th><th>Leadership</th><th>Likely provider</th>' +
           '<th class="num">2nd contact</th><th></th>') + '</tr></thead><tbody>' +
-    jobs.map((j) => (basic || j.mode === 'basic' || (j.result && j.result.basic)) ? basicRow(j, !basic) : reviewRow(j)).join('') + '</tbody></table></div>' +
+    jobs.map((j, i) => (i === 0 || jobs[i - 1].runId !== j.runId ? runSeparator(j, basic ? 10 : 9) : '') +
+      (isBasicJob(j) ? basicRow(j, !basic) : reviewRow(j))).join('') + '</tbody></table></div>' +
     '<div class="bar-sticky"><button class="btn primary" id="write" disabled>Write 0 to Zoho</button>' +
     '<button class="btn ghost sm" id="approve-all">Approve all clean</button>' +
     '<span class="muted tiny" id="write-note"></span></div>' +
@@ -799,6 +807,13 @@ function renderReview() {
   $$('#review-body .toggle').forEach((b) => b.onclick = () => {
     open.has(b.dataset.id) ? open.delete(b.dataset.id) : open.add(b.dataset.id);
     renderReview();
+  });
+  $$('#review-body .discard').forEach((b) => b.onclick = async () => {
+    if (!confirm('Remove ' + b.dataset.company + ' from Review without writing it to Zoho? The research stays in the run history and the lead can be profiled again.')) return;
+    b.disabled = true;
+    const r = await api('/api/review/discard', { leadIds: [b.dataset.id] });
+    approved.delete(b.dataset.id);
+    if (r.review) { S.review = r.review; renderReview(); renderNav(); }
   });
   $('#approve-all').onclick = () => {
     // "Clean" now also means it has a company description. Approving a lead without
@@ -835,6 +850,20 @@ function syncWrite() {
 }
 
 const isBasic = (run) => !!(run && run.mode === 'basic');
+
+// One heading row per run inside the queue, so a result's age and origin are clear.
+function runSeparator(j, cols) {
+  const when = j.runStartedAt ? new Date(j.runStartedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+  const current = S.run && S.run.id === j.runId;
+  return '<tr class="run-sep"><td colspan="' + cols + '" style="padding:8px 12px;background:var(--panel2);font-size:11px;letter-spacing:.06em;color:var(--dim2)">' +
+    'RUN ' + esc(j.runId) + ' · ' + (j.runMode === 'basic' ? 'basic' : 'comprehensive') + ' · ' + esc(when) +
+    (current ? ' · <span class="pill cool">latest</span>' : '') + '</td></tr>';
+}
+// open/hide plus, for a row still waiting, a way out of the queue that is not a write.
+function actionsCell(j, isOpen) {
+  return '<td style="white-space:nowrap"><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen ? 'hide' : 'open') + '</button>' +
+    (j.written ? '' : ' <button class="link discard" data-id="' + esc(j.leadId) + '" data-company="' + esc(j.company) + '" style="margin-left:8px;color:var(--dim2)">remove</button>') + '</td>';
+}
 const modePill = (run) => isBasic(run) ? '<span class="pill cool">basic</span>' : '<span class="pill ok">comprehensive</span>';
 
 function basicRow(j, inFullTable) {
@@ -852,7 +881,7 @@ function basicRow(j, inFullTable) {
       '<td class="tiny">' + leadershipCell(r) + '</td>' +
       '<td class="tiny">' + esc(b.hcm ? b.hcm + ' (applicant system)' : '') + '</td>' +
       '<td class="num tiny">' + ((r.additionalContacts || []).length || '') + '</td>' +
-      '<td><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen2 ? 'hide' : 'open') + '</button></td></tr>' +
+      actionsCell(j, isOpen2) + '</tr>' +
       (isOpen2 ? '<tr><td colspan="9" style="padding:0"><div class="detail">' + basicDetail(j) + '</div></td></tr>' : '');
   }
   const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || b.ceo || '—';
@@ -877,7 +906,7 @@ function basicRow(j, inFullTable) {
     '<td class="tiny">' + esc(b.hq || '') + (b.execLocation && b.execLocation !== b.hq ? '<br><span class="muted">owners: ' + esc(b.execLocation) + '</span>' : '') + '</td>' +
     '<td class="tiny">' + (reach || '<span class="pill flag">none</span>') + '</td>' +
     '<td class="tiny">' + leadershipCell(r) + '</td>' +
-    '<td><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen ? 'hide' : 'open') + '</button></td></tr>' +
+    actionsCell(j, isOpen) + '</tr>' +
     (isOpen ? '<tr><td colspan="10" style="padding:0"><div class="detail">' + basicDetail(j) + '</div></td></tr>' : '');
 }
 
@@ -929,7 +958,7 @@ function reviewRow(j) {
     '<td class="tiny">' + leadershipCell(r) + '</td>' +
     '<td class="tiny" style="max-width:240px">' + esc((r.fields && r.fields.Current_PR_Provider_new) || '') + '</td>' +
     '<td class="num tiny">' + ((r.additionalContacts || []).length || '') + '</td>' +
-    '<td><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen ? 'hide' : 'open') + '</button></td></tr>' +
+    actionsCell(j, isOpen) + '</tr>' +
     (isOpen ? '<tr><td colspan="9" style="padding:0"><div class="detail">' + detail(j) + '</div></td></tr>' : '');
 }
 
@@ -1460,6 +1489,7 @@ es.onmessage = (e) => {
   else if (m.type === 'leads') { S.leads = m.leads; renderPicker(); }
   else if (m.type === 'preflight') { S.preflight = m.preflight; if (isAdmin()) renderSetup(); renderNav(); }
   else if (m.type === 'readiness') { S.readiness = m.readiness; renderReady(); renderNav(); }
+  else if (m.type === 'review') { S.review = m.review; renderReview(); renderNav(); }
 };
 
 window.go = go;
