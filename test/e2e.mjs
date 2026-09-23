@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { startZohoStub } from './zoho-stub.mjs';
 
 const ROOT = path.resolve(new URL('..', import.meta.url).pathname);
 const STORE = path.join(ROOT, 'storage-test');
@@ -9,6 +10,13 @@ fs.rmSync(STORE, { recursive: true, force: true });
 const PORT = 8971;
 const BASE = `http://127.0.0.1:${PORT}`;
 const env = { ...process.env, DATA_DIR: STORE, PORT: String(PORT), ADMIN_EMAIL: 'boss@chs.test', ADMIN_PASSWORD: 'adminpass123', ADMIN_NAME: 'Boss' };
+// Zoho is a stand-in on localhost: the server reads its hosts from zoho.json, so the
+// whole direct path — token, org, fields, writes — runs against it, and the
+// readiness gate has something real to lose.
+const zohoStub = await startZohoStub(8973);
+fs.mkdirSync(path.join(STORE, 'data'), { recursive: true });
+fs.writeFileSync(path.join(STORE, 'data', 'zoho.json'), JSON.stringify(zohoStub.zohoJson));
+const zoomInfo = (mode) => { const f = path.join(STORE, 'mcp-stub.txt'); if (mode) fs.writeFileSync(f, mode); else fs.rmSync(f, { force: true }); };
 
 function boot() {
   const child = spawn('node', ['server.mjs'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -60,7 +68,7 @@ r = await call('admin', '/api/users/' + rep.id, { zohoOwnerId: '999', zohoOwnerN
 r = await call('rep', '/api/state'); assert.equal(r.json.scope.lockOwner, '999'); ok('rep scope now pinned to owner 999');
 r = await call('rep', '/api/run', { leads: [{ id: '5', company: 'X', owner: { id: '123' } }] }); assert.equal(r.status, 403); ok('rep cannot profile a lead owned by someone else');
 
-// 5. Run + write for the rep (stub CLI; Zoho unconfigured so write goes through the CLI path too)
+// 5. Run + write for the rep (stub CLI, stub Zoho; the write goes straight to the stub CRM)
 r = await call('rep', '/api/run', { leads: [{ id: '5001', company: 'Alpha Care', owner: { id: '999' } }, { id: '5002', company: 'Beta School', owner: { id: '999' } }] });
 assert.equal(r.status, 200); const runId = r.json.runId; ok('rep starts a 2-lead run ' + runId);
 r = await call('rep', '/api/run', { leads: [{ id: '5003', company: 'C', owner: { id: '999' } }] }); assert.equal(r.status, 409); ok('second concurrent run refused');
@@ -78,6 +86,8 @@ r = await call('admin', '/api/state'); assert.equal(r.json.run, null); ok("admin
 r = await call('rep', '/api/write', { leadIds: ['5001'] }); assert.equal(r.json.queued, 1); ok('rep queues one write');
 s = await pollRun('rep', (x) => x.run.jobs.find((j) => j.leadId === '5001').written);
 assert.equal(s.run.jobs.find((j) => j.leadId === '5002').written, false); ok('only the approved lead was written');
+assert.equal(zohoStub.state.writes.length, 1); assert.equal(zohoStub.state.writes[0].id, '5001'); assert.equal(zohoStub.state.writes[0].First_Name, 'Pat');
+assert.ok(zohoStub.state.notes.some((n) => n.leadId === '5001' && n.Note_Title === 'PAYROLL FINDINGS')); ok('…and it landed in the CRM as a field update plus notes');
 
 // 5a. Hard stops and the fallback ladder
 r = await call('rep', '/api/run', { leads: [{ id: '5501', company: 'Runaway Inc', owner: { id: '999' } }, { id: '5502', company: 'Gamma LLC', owner: { id: '999' } }] });
@@ -111,7 +121,7 @@ assert.equal(s.run.jobs[0].result.basic.hcm, 'Paylocity'); assert.equal(s.run.jo
 assert.equal(JSON.parse(fs.readFileSync(path.join(STORE, 'data', 'history.json'))).runs.find((x) => x.id === basicRunId).mode, 'basic'); ok('mode persisted to history');
 r = await call('rep', '/api/write', { leadIds: ['6000', '6001'] }); assert.equal(r.json.queued, 2); ok('basic results queue for write');
 s = await pollRun('rep', (x) => x.run.jobs.filter((j) => j.written).length === 2);
-ok('basic writes complete through the CLI fallback');
+assert.ok(zohoStub.state.writes.some((w) => w.id === '6000' && w.Profile_Type === 'Basic')); ok('basic writes land directly, stamped Profile_Type = Basic');
 r = await call('rep', '/api/run', { leads: Array.from({ length: 51 }, (_, i) => ({ id: String(7000 + i), company: 'X', owner: { id: '999' } })) });
 assert.equal(r.status, 400); assert.match(r.json.error, /Basic profile/); ok('51-lead full run refused and pointed at basic');
 
@@ -120,6 +130,40 @@ r = await call('rep', '/api/stats?scope=all'); assert.equal(r.status, 403); ok('
 r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 30); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
 assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 4); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
 r = await call('admin', '/api/stats'); assert.equal(r.json.totalLeads, 0); ok("admin's own stats are separate");
+
+// 6a. The readiness gate: nothing runs while Zoho cannot take the write-back or
+//     ZoomInfo is not signed in, and the reason is reported instead.
+r = await call('rep', '/api/readiness'); assert.equal(r.json.readiness.ok, true); assert.equal(r.json.readiness.checks.zoho.ok, true); assert.equal(r.json.readiness.checks.zoominfo.ok, true);
+assert.match(r.json.readiness.checks.zoominfo.status, /Connected/); assert.equal(r.json.readiness.checks.zoho.org, 'Stub Payroll Co'); ok('readiness: Zoho writable and ZoomInfo connected');
+r = await call('rep', '/api/state'); assert.equal(r.json.readiness.ok, true); ok('readiness travels with /api/state');
+zoomInfo('needs-auth');
+r = await call('rep', '/api/readiness?fresh=1'); assert.equal(r.json.readiness.ok, false); assert.equal(r.json.readiness.issues.length, 1); assert.equal(r.json.readiness.issues[0].key, 'zoominfo');
+assert.match(r.json.readiness.issues[0].detail, /sign-in on the server has expired/); assert.match(r.json.readiness.issues[0].fix, /claude mcp login zoominfo/); ok('ZoomInfo needing sign-in is reported with the fix');
+r = await call('rep', '/api/run', { leads: [{ id: '8001', company: 'Blocked Co', owner: { id: '999' } }] });
+assert.equal(r.status, 503); assert.equal(r.json.error, 'blocked'); assert.match(r.json.message, /ZoomInfo/); assert.equal(r.json.readiness.ok, false); ok('a run is refused while ZoomInfo is down, with the reason');
+r = await call('rep', '/api/run', { mode: 'basic', leads: [{ id: '8002', company: 'Blocked Co', owner: { id: '999' } }] }); assert.equal(r.status, 503); ok('…a basic run too');
+r = await call('rep', '/api/state'); assert.equal(r.json.run.id, basicRunId); assert.equal(r.json.run.jobs.length, 25); ok('…and no run was started');
+{ const h = await fetch(BASE + '/healthz').then((x) => x.json()); assert.equal(h.liveSessions, 0); assert.equal(h.liveProcesses, 0); ok('no session was spent on the refused run'); }
+r = await call('rep', '/api/write', { leadIds: ['6003'] }); assert.equal(r.json.queued, 1); ok('a write of finished results still goes through when only ZoomInfo is down');
+s = await pollRun('rep', (x) => x.run.jobs.find((j) => j.leadId === '6003').written);
+zoomInfo('down');
+r = await call('rep', '/api/readiness?fresh=1'); assert.match(r.json.readiness.issues[0].detail, /cannot reach ZoomInfo right now: Failed to connect/); ok('an unreachable ZoomInfo server is reported as such');
+zoomInfo('missing');
+r = await call('rep', '/api/readiness?fresh=1'); assert.match(r.json.readiness.issues[0].detail, /not registered as an MCP server/); assert.match(r.json.readiness.issues[0].fix, /claude mcp add/); ok('an unregistered ZoomInfo server is reported with the add command');
+zoomInfo(null);
+zohoStub.state.tokenOk = false;
+r = await call('rep', '/api/readiness?fresh=1'); assert.equal(r.json.readiness.ok, false); assert.equal(r.json.readiness.issues.length, 1); assert.equal(r.json.readiness.issues[0].key, 'zoho');
+assert.match(r.json.readiness.issues[0].detail, /Zoho refused the connection: Token refresh failed: invalid_code/); ok('a revoked Zoho token is reported');
+r = await call('rep', '/api/run', { leads: [{ id: '8003', company: 'Blocked Co', owner: { id: '999' } }] }); assert.equal(r.status, 503); assert.match(r.json.message, /Zoho refused/); ok('a run is refused while Zoho is down');
+r = await call('rep', '/api/write', { leadIds: ['6004'] }); assert.equal(r.status, 503); assert.match(r.json.error, /Nothing was written\. Zoho refused/); ok('a write is refused while Zoho is down');
+assert.equal((await call('rep', '/api/state')).json.run.jobs.find((j) => j.leadId === '6004').written, false); ok('…and the lead stays unwritten');
+zohoStub.state.tokenOk = true; zohoStub.state.scope = 'ZohoCRM.modules.READ ZohoCRM.org.READ';
+r = await call('rep', '/api/readiness?fresh=1'); assert.equal(r.json.readiness.ok, false); assert.match(r.json.readiness.issues[0].detail, /cannot write to Leads/); assert.match(r.json.readiness.issues[0].fix, /ZohoCRM\.modules\.ALL/); ok('a read-only Zoho token is reported as unable to write back');
+r = await call('rep', '/api/run', { leads: [{ id: '8004', company: 'Blocked Co', owner: { id: '999' } }] }); assert.equal(r.status, 503); ok('…and blocks the run');
+zohoStub.state.scope = 'ZohoCRM.modules.ALL ZohoCRM.settings.READ ZohoCRM.users.READ ZohoCRM.org.READ';
+r = await call('admin', '/api/zoho/config', { dc: 'com', clientId: 'stub-client' }); assert.equal(r.json.ok, true); ok('admin re-saves Zoho, which drops the old token');
+r = await call('rep', '/api/readiness?fresh=1'); assert.equal(r.json.readiness.ok, true); ok('readiness recovers once both connections are back');
+r = await call('rep', '/api/write', { leadIds: ['6004'] }); assert.equal(r.json.queued, 1); s = await pollRun('rep', (x) => x.run.jobs.find((j) => j.leadId === '6004').written); ok('…and the held write goes through');
 
 // 7. Restart → restore
 child.kill(); await wait(500); child = boot(); await up();
@@ -133,6 +177,6 @@ r = await call('rep', '/api/write', { leadIds: ['6002'] }); assert.equal(r.json.
 r = await call('admin', '/api/users/' + rep.id, { enabled: false }); r = await call('rep', '/api/state'); assert.equal(r.status, 401); ok('disabling a user kills their session');
 r = await call('admin', '/api/logout', {}); r = await call('admin', '/api/state'); assert.equal(r.status, 401); ok('logout clears session');
 
-child.kill();
+child.kill(); zohoStub.close();
 fs.rmSync(STORE, { recursive: true, force: true });
 console.log(`\n${pass} checks passed`);

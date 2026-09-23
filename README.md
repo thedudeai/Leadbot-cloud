@@ -77,6 +77,31 @@ no longer takes the run down; stopped sessions get an estimated cost from their 
 (marked *est.*) so Stats stops under-counting them; `config.json` from an earlier version gets the
 new defaults and `model` is migrated from '' (the CLI's priciest default) to `sonnet`.
 
+## Nothing runs unless it can finish (23 Sep 2026)
+
+A profile is only worth its credits if it can be written back and if ZoomInfo answered. So the
+server now checks both connections **before every run and every write-back**, and every five
+minutes in between while a dashboard is open:
+
+| Check | How | Blocks when |
+|---|---|---|
+| Zoho | refreshes the token if needed and reads `/crm/v8/org`; looks at the granted scopes | not configured · token refresh fails · Zoho refuses the call · the token has no `ZohoCRM.modules.ALL` (or `leads.*` write) scope |
+| ZoomInfo | runs the CLI's own health check, `claude mcp list`, and reads the `zoominfo` line | no `zoominfo` server registered · `Needs authentication` · `Failed to connect` · the CLI itself does not answer |
+
+When either fails, **Profile** and **Basic profile** are disabled on everyone's Run screen and a
+red notice at the top says what is wrong and, for admins, what fixes it (reps see "ask your
+admin"). A run request that slips through anyway is refused with HTTP 503 and `error: "blocked"`.
+Write-back is refused only when Zoho is the problem — finished results can still be written
+while ZoomInfo is down. Every change of state is pushed over the event stream, so the notice
+appears the moment a connection breaks and clears the moment it is fixed; **check again** on the
+notice (or under Setup → Connections) re-checks on demand, and saving new Zoho credentials or a
+new Claude command re-checks straight away. `GET /api/readiness` (`?fresh=1` to skip the
+one-minute cache) returns the current answer.
+
+The usual fixes: a Zoho refresh token stops working the moment a new one is generated for the
+same client (paste the new one under Setup → Zoho connection); ZoomInfo's OAuth login on the box
+expires now and then (`claude mcp login zoominfo --no-browser` as described below, then Preflight).
+
 ## Files
 
 | File | Role |
@@ -87,7 +112,7 @@ new defaults and `model` is migrated from '' (the CLI's priciest default) to `so
 | `skill/zoho-lead-profiler/` | the skill, read by every profiling session at its exact path |
 | `segments.default.json` | seeds `segments.json` on first boot |
 | `Dockerfile`, `railway.json` | the image (Node 22 + Claude Code CLI, non-root) and Railway config |
-| `test/e2e.mjs`, `test/ui.mjs` | API and headless-browser tests against a stubbed `claude` |
+| `test/e2e.mjs`, `test/ui.mjs` | API and headless-browser tests against a stubbed `claude` and a stand-in Zoho (`test/zoho-stub.mjs`) |
 
 ## Environment variables
 
@@ -101,8 +126,9 @@ in to the company's Claude account), and the three `ZOHO_*` credentials.
 DATA_DIR=./storage ADMIN_EMAIL=you@x.com ADMIN_PASSWORD=something-long node server.mjs
 ```
 
-then open `http://localhost:8765`. `npm test` runs both test suites (they use a stub CLI and
-need no credentials; `test/ui.mjs` needs Playwright available globally).
+then open `http://localhost:8765`. `npm test` runs both test suites (they use a stub CLI and a
+stand-in Zoho server on localhost, so they need no credentials; `test/ui.mjs` needs Playwright
+installed globally — `npm root -g` is where it looks, or set `PLAYWRIGHT_ROOT`).
 
 ## Deploying
 

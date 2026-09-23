@@ -1,6 +1,22 @@
 #!/usr/bin/env node
 // Stand-in for the Claude Code CLI: reads the prompt from stdin, answers with the
 // same stream-json shape the real CLI emits, choosing the payload by prompt type.
+// It also answers the two plain commands the server runs: `--version`, and
+// `mcp list`, whose ZoomInfo line is steered by DATA_DIR/mcp-stub.txt so a test
+// can take ZoomInfo away ("needs-auth", "down", "missing") and give it back.
+import fs from 'node:fs';
+import path from 'node:path';
+if (process.argv.includes('--version')) { process.stdout.write('9.9.9 (Claude Code stub)\n'); process.exit(0); }
+if (process.argv.includes('mcp') && process.argv.includes('list')) {
+  let mode = 'connected';
+  try { mode = fs.readFileSync(path.join(process.env.DATA_DIR || '.', 'mcp-stub.txt'), 'utf8').trim() || mode; } catch {}
+  const line = mode === 'missing' ? 'No MCP servers configured. Use `claude mcp add` to add a server.'
+    : mode === 'needs-auth' ? 'zoominfo: https://mcp.zoominfo.com/mcp (HTTP) - ⚠ Needs authentication'
+    : mode === 'down' ? 'zoominfo: https://mcp.zoominfo.com/mcp (HTTP) - ✗ Failed to connect — ECONNREFUSED: Unable to connect.'
+    : 'zoominfo: https://mcp.zoominfo.com/mcp (HTTP) - ✓ Connected';
+  process.stdout.write('Checking MCP server health…\n\n' + line + '\n');
+  process.exit(0);
+}
 let prompt = '';
 process.stdin.on('data', (c) => (prompt += c));
 process.stdin.on('end', () => {

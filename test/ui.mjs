@@ -1,13 +1,22 @@
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { chromium } from '/home/claude/.npm-global/lib/node_modules/playwright/index.mjs';
+import { startZohoStub } from './zoho-stub.mjs';
+
+// Playwright is installed globally, wherever this machine keeps its global modules.
+const globalRoot = process.env.PLAYWRIGHT_ROOT || execSync('npm root -g').toString().trim();
+const { chromium } = await import(path.join(globalRoot, 'playwright', 'index.mjs'));
 
 const ROOT = path.resolve(new URL('..', import.meta.url).pathname);
 const STORE = path.join(ROOT, 'storage-ui');
 fs.rmSync(STORE, { recursive: true, force: true });
 const PORT = 8972, BASE = `http://127.0.0.1:${PORT}`;
 const env = { ...process.env, DATA_DIR: STORE, PORT: String(PORT), ADMIN_EMAIL: 'boss@chs.test', ADMIN_PASSWORD: 'adminpass123', ADMIN_NAME: 'Boss' };
+// Zoho is a stand-in on localhost, so the Run screen browses directly and writes land.
+const zohoStub = await startZohoStub(8974);
+fs.mkdirSync(path.join(STORE, 'data'), { recursive: true });
+fs.writeFileSync(path.join(STORE, 'data', 'zoho.json'), JSON.stringify(zohoStub.zohoJson));
+const zoomInfo = (mode) => { const f = path.join(STORE, 'mcp-stub.txt'); if (mode) fs.writeFileSync(f, mode); else fs.rmSync(f, { force: true }); };
 const child = spawn('node', ['server.mjs'], { cwd: ROOT, env, stdio: 'ignore' });
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 for (let i = 0; i < 40; i++) { try { if ((await fetch(BASE + '/healthz')).ok) break; } catch {} await wait(150); }
@@ -18,7 +27,7 @@ async function page(who) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const pg = await ctx.newPage();
   pg.on('pageerror', (e) => errors.push(`[${who}] pageerror ${e.message}`));
-  pg.on('response', (rs) => { if (rs.status() >= 400) rs.text().then((t) => console.log('  HTTP', rs.status(), rs.request().method(), rs.url(), t, rs.request().postData(), Date.now())); });
+  pg.on('response', (rs) => { if (rs.status() >= 400) { console.log('  HTTP', rs.status(), rs.request().method(), rs.url(), rs.request().postData(), rs.request().resourceType()); rs.text().then((t) => console.log('    body:', t)).catch(() => {}); } });
   pg.on('console', (m) => { if (m.type() === 'error') errors.push(`[${who}] console ${m.text()}`); });
   return pg;
 }
@@ -44,17 +53,20 @@ await a.waitForSelector('#team-body tbody tr:nth-child(2)');
 console.log('  team rows:', await a.locator('#team-body tbody tr').count());
 await a.screenshot({ path: path.join(ROOT, 'test', 'shot-admin-team.png') });
 
-// mark rep as sees-all so they can run without Zoho (no owner ids in fallback rows)
+// mark rep as sees-all so they browse the whole stub org rather than one owner's leads
 const repRow = a.locator('#team-body tbody tr').nth(1);
 await repRow.locator('[data-k=seeAll]').check(); await wait(400);
 
-// rep: log in, confirm admin screens are hidden, run 2 leads via the Claude fallback path
+// rep: log in, confirm admin screens are hidden, browse the stub CRM directly and profile a lead
 const r = await page('rep');
 await r.goto(BASE + '/login'); await r.fill('#email', 'rep@chs.test'); await r.fill('#password', 'reppass123'); await r.click('#go');
 await r.waitForURL(BASE + '/'); await r.waitForSelector('#who b');
 for (const v of ['segments', 'team', 'setup']) if (!(await r.locator(`nav button[data-v="${v}"]`).isHidden())) throw new Error('rep can see ' + v);
 console.log('  rep nav ok; banner:', (await r.textContent('#run-banner')).slice(0, 60).trim());
-await r.click('.seg'); await r.click('#load'); await r.waitForSelector('#picker tbody tr', { timeout: 15000 });
+if (await r.locator('#load').isVisible()) throw new Error('Load-via-Claude button shown although Zoho is connected');
+await r.click('.seg'); await r.waitForSelector('#picker tbody tr', { timeout: 15000 });
+await r.waitForSelector('#ready-banner', { state: 'attached' });
+if (await r.locator('#ready-banner [data-ready="blocked"]').count()) throw new Error('blocked notice shown while both connections are up');
 await r.click('#picker tbody tr input'); await r.click('#start');
 await r.waitForSelector('#live .pill.ok', { timeout: 20000 });
 await r.waitForSelector('#nb-review:text-is("1")', { timeout: 10000 });
@@ -112,11 +124,43 @@ await r.click('#pw').catch(() => {});
   void cfg;
 }
 
+// ZoomInfo loses its sign-in: the notice appears on the rep's Run screen without a
+// reload, the Start buttons go off, the server refuses a run, and it all clears
+// again once the connection is back and someone presses "check again".
+{
+  await r.click('nav button[data-v="run"]'); await r.waitForSelector('#picker tbody tr', { timeout: 15000 });
+  await r.click('#picker tbody tr input');
+  if (await r.locator('#start').isDisabled()) throw new Error('start disabled before the outage');
+  zoomInfo('needs-auth');
+  await a.click('nav button[data-v="setup"]'); await a.click('#ready-setup .ready-recheck');
+  await r.waitForSelector('#ready-banner [data-ready="blocked"]', { timeout: 60000 });
+  const notice = await r.textContent('#ready-banner');
+  if (!notice.includes('Profiling is paused') || !notice.includes('ZoomInfo')) throw new Error('blocked notice wrong: ' + notice);
+  if (notice.includes('claude mcp login')) throw new Error('rep was shown the admin fix');
+  if (!notice.includes('Ask your admin')) throw new Error('rep notice lacks the ask-your-admin line');
+  if (!(await r.locator('#start').isDisabled()) || !(await r.locator('#start-basic').isDisabled())) throw new Error('start buttons still enabled while blocked');
+  // Through the context's request API rather than an in-page fetch: the refusal is
+  // the point, and Chromium would log the 503 as a console error otherwise.
+  const refused = await r.request.post(BASE + '/api/run', { data: { leads: [{ id: '111', company: 'Stub Co' }] } });
+  if (refused.status() !== 503) throw new Error('server did not refuse the run: ' + refused.status());
+  if ((await refused.json()).error !== 'blocked') throw new Error('refusal body wrong');
+  await a.waitForSelector('#ready-setup [data-ready="blocked"]', { timeout: 10000 });
+  if (!(await a.textContent('#ready-setup')).includes('claude mcp login zoominfo')) throw new Error('admin notice lacks the fix');
+  if ((await a.textContent('#nb-setup')) !== '!') throw new Error('setup badge not flagged');
+  await r.screenshot({ path: path.join(ROOT, 'test', 'shot-rep-blocked.png'), fullPage: true });
+  zoomInfo(null);
+  await r.click('#ready-banner .ready-recheck');
+  await r.waitForSelector('#ready-banner [data-ready="blocked"]', { state: 'detached', timeout: 60000 });
+  if (await r.locator('#start').isDisabled()) throw new Error('start still disabled after recovery');
+  await a.waitForSelector('#ready-setup [data-ready="ok"], #ready-setup [data-ready="warn"]', { timeout: 10000 });
+  console.log('  outage notice shown, run refused, buttons off; cleared on recovery');
+}
+
 // admin sees rep's run in Everyone stats
 await a.click('nav button[data-v="stats"]'); await a.click('#stats-scope button[data-scope="all"]'); await wait(500);
 console.log('  admin everyone-stats has by-person:', (await a.textContent('#stats-body')).includes('Rep One'));
 await a.screenshot({ path: path.join(ROOT, 'test', 'shot-admin-stats.png'), fullPage: true });
 
-await browser.close(); child.kill(); fs.rmSync(STORE, { recursive: true, force: true });
+await browser.close(); child.kill(); zohoStub.close(); fs.rmSync(STORE, { recursive: true, force: true });
 if (errors.length) { console.log('BROWSER ERRORS:\n' + errors.join('\n')); process.exit(1); }
 console.log('\n  UI pass clean — no page or console errors.');
