@@ -230,6 +230,7 @@
 <section class="view on" data-v="run">
   <h1>Run</h1>
   <p class="sub">Search Zoho, filter it, tick the leads worth the credits, and start. Browsing reads the CRM directly and costs nothing. Each lead you profile then gets its own Claude session on the server, and nothing reaches Zoho until you approve it in Review.</p>
+  <div id="ready-banner"></div>
   <div id="scope-banner"></div>
   <div id="run-banner"></div>
 
@@ -308,6 +309,10 @@
   <h1>Setup</h1>
   <p class="sub">Lead Bot does none of the work itself. The server launches Claude Code for each lead, and Claude does the searching and verifying through the company's connectors. This screen is where you confirm that link is live. Only admins see it.</p>
 
+  <h2>Connections</h2>
+  <p class="sub" style="margin-bottom:12px">Checked before every run and every write-back, and every few minutes in between. If Zoho cannot take the write-back or ZoomInfo is not signed in, profiling pauses everywhere and the reason shows on everyone's Run screen — no session is started for a lead that could not be finished.</p>
+  <div id="ready-setup"></div>
+
   <h2>Zoho connection</h2>
   <p class="sub" style="margin-bottom:12px">A direct link to the CRM. It makes the Run screen instant and free — no Claude session is started just to list records — and the write-back goes through it too. Profiling is still the Claude side of the job.</p>
   <div id="zoho-body"></div>
@@ -362,7 +367,7 @@ const api = async (p, body) => {
   return r.json();
 };
 
-let S = { config: {}, segments: [], leads: [], run: null, stats: null, preflight: null, user: null, scope: { mapped: true, lockOwner: null }, admin: false };
+let S = { config: {}, segments: [], leads: [], run: null, stats: null, preflight: null, readiness: null, user: null, scope: { mapped: true, lockOwner: null }, admin: false };
 const isAdmin = () => !!S.admin;
 let chosenSeg = null;
 // Keyed by lead id and holding the whole row, so a selection survives paging,
@@ -397,7 +402,7 @@ async function load() {
   renderScope();
   renderAll();
 }
-function renderAll() { renderSegs(); renderPicker(); renderLive(); renderReview(); renderStats(); if (isAdmin()) { renderSegEditor(); renderSetup(); renderTeam(); } renderNav(); }
+function renderAll() { renderSegs(); renderPicker(); renderLive(); renderReview(); renderStats(); if (isAdmin()) { renderSegEditor(); renderSetup(); renderTeam(); } renderReady(); renderNav(); }
 
 function renderWho() {
   const u = S.user || {};
@@ -432,7 +437,7 @@ function renderNav() {
   $('#nb-review').textContent = done;
   $('#nb-stats').textContent = (S.stats && S.stats.totalLeads) || 0;
   const p = S.preflight;
-  $('#nb-setup').textContent = !p ? '?' : (p.skill && p.zoho && p.zohoLeadsReachable) ? '✓' : '!';
+  $('#nb-setup').textContent = readyBlocked() ? '!' : !p ? '?' : (p.zoho && p.zoominfo && !p.error) ? '✓' : '!';
 }
 
 /* ---------------------------------------------------------- run: segments */
@@ -642,8 +647,12 @@ function renderPicker() {
   const sync = () => {
     const c = picked.size;
     const b = $('#start'), bb = $('#start-basic');
-    b.disabled = !c; b.textContent = 'Profile ' + c + ' lead' + (c === 1 ? '' : 's');
-    bb.disabled = !c; bb.textContent = 'Basic profile ' + c + ' lead' + (c === 1 ? '' : 's');
+    // While a connection is down the buttons stay off: the notice at the top of
+    // the screen says what is wrong, and no credits go into a run that cannot finish.
+    const blocked = readyBlocked();
+    b.disabled = !c || blocked; b.textContent = 'Profile ' + c + ' lead' + (c === 1 ? '' : 's');
+    bb.disabled = !c || blocked; bb.textContent = 'Basic profile ' + c + ' lead' + (c === 1 ? '' : 's');
+    b.title = blocked ? 'Profiling is paused — see the notice at the top of this screen.' : '';
     const conc = S.config.concurrency || 3, bconc = S.config.basicConcurrency || 20;
     $('#est').textContent = c
       ? 'Full: ~' + Math.ceil(c / conc) * 8 + '–' + Math.ceil(c / conc) * 15 + ' min at ' + conc + ' at a time \u00b7 Basic: ~' + Math.ceil(c / bconc) * 2 + '–' + Math.ceil(c / bconc) * 5 + ' min at ' + bconc + ' at a time'
@@ -683,14 +692,21 @@ function renderPicker() {
   if ($('#per')) $('#per').onchange = () => { browse.per = Number($('#per').value) || 50; browse.page = 1; browseFetch(); };
   const kick = async (mode, force) => {
     $('#start').disabled = true; $('#start-basic').disabled = true;
+    $(mode === 'basic' ? '#start-basic' : '#start').textContent = 'Checking connections…';
     const r = await api('/api/run', { leads: Array.from(picked.values()), pepm: Number($('#pepm').value) || S.config.pepm, mode, force: !!force });
+    if (r.error === 'blocked' && r.readiness) {
+      // The server refused to start: a connection is down. Show the notice and stop.
+      S.readiness = r.readiness; renderReady(); sync();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
     if (r.error === 'recent' && r.recent) {
       // A lead done in the last week costs a whole lead's credits to do again.
       const names = r.recent.map((x) => x.company + ' (' + (x.profileType || 'profiled') + ' ' + new Date(x.profiledDate).toLocaleDateString() + ')').join('\n');
       if (confirm(r.recent.length + ' of these leads ' + (r.recent.length === 1 ? 'was' : 'were') + ' profiled in the last 7 days:\n\n' + names + '\n\nProfile them again anyway?')) return kick(mode, true);
-      $('#start').disabled = false; $('#start-basic').disabled = false; return;
+      sync(); return;
     }
-    if (r.error) { $('#run-banner').innerHTML = '<div class="banner bad">' + esc(r.error) + '</div>'; $('#start').disabled = false; $('#start-basic').disabled = false; }
+    if (r.error) { $('#run-banner').innerHTML = '<div class="banner bad">' + esc(r.error) + '</div>'; sync(); }
   };
   $('#start').onclick = () => kick('full');
   $('#start-basic').onclick = () => kick('basic');
@@ -809,7 +825,7 @@ function writePathLine() {
   if (z && z.configured && z.ok) return 'Writes go straight to Zoho over the connection set up in Setup — no Claude session, no credits, near instant.';
   const fix = isAdmin() ? 'Fix it under <button class="link" onclick="go(\'setup\')">Setup</button> first.' : 'Ask your admin to fix it first.';
   if (z && z.configured) return 'Zoho is saved but the connection is failing right now, so the write will not go through. ' + fix;
-  return 'Zoho is not connected, so the write falls back to a Claude session — which only works if the server\'s Claude account has a Zoho connector. ' + (isAdmin() ? 'Connect Zoho under <button class="link" onclick="go(\'setup\')">Setup</button> to write directly instead.' : 'Ask your admin to connect Zoho.');
+  return 'Zoho is not connected, so nothing can be written until it is. ' + (isAdmin() ? 'Connect Zoho under <button class="link" onclick="go(\'setup\')">Setup</button>.' : 'Ask your admin to connect Zoho.');
 }
 
 function syncWrite() {
@@ -1377,6 +1393,52 @@ $('#c-save').onclick = async () => {
   setTimeout(() => { $('#c-note').textContent = ''; }, 2000);
 };
 
+/* ---------------------------------------------------------- readiness */
+// Can a run actually finish? The server checks Zoho (reachable, allowed to write)
+// and ZoomInfo (registered and signed in) before every run and every write, and
+// pushes every change over the event stream. Blocked means the Start buttons are
+// off and this notice says why and what fixes it.
+const readyBlocked = () => !!(S.readiness && S.readiness.at && !S.readiness.ok);
+
+function readyHtml(r, where) {
+  const when = r && r.at ? new Date(r.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+  const again = '<button class="link ready-recheck">check again</button>';
+  if (!r || !r.at) return '<div class="banner" style="border-color:var(--line)"><span class="spin"></span> Checking the Zoho and ZoomInfo connections…</div>';
+  const fixLine = (i) => isAdmin()
+    ? (i.fix ? '<br><span class="muted tiny">' + esc(i.fix) + '</span>' : '')
+    : '<br><span class="muted tiny">Ask your admin — this is fixed under Setup.</span>';
+  const item = (i) => '<div style="margin-top:8px"><b>' + esc(i.title) + '.</b> ' + esc(i.detail) + fixLine(i) + '</div>';
+  if (!r.ok) {
+    return '<div class="banner bad" data-ready="blocked"><b>Profiling is paused until this is fixed.</b> Nothing runs, so no credits are spent on leads that could not be finished or written back.' +
+      r.issues.map(item).join('') +
+      '<div class="muted tiny" style="margin-top:10px">Checked at ' + esc(when) + ' · re-checked automatically every few minutes · ' + again + '</div></div>';
+  }
+  if (r.warnings && r.warnings.length) {
+    return '<div class="banner warn" data-ready="warn"><b>Connections are up, with a warning.</b>' + r.warnings.map(item).join('') +
+      '<div class="muted tiny" style="margin-top:10px">Checked at ' + esc(when) + ' · ' + again + '</div></div>';
+  }
+  if (where !== 'setup') return '';
+  const z = r.checks && r.checks.zoho, zi = r.checks && r.checks.zoominfo;
+  return '<div class="banner ok" data-ready="ok"><span class="pill ok">ready</span> <b>Zoho' + (z && z.org ? ' (' + esc(z.org) + ')' : '') + ' can take the write-back and ZoomInfo is connected' +
+    (zi && zi.status ? ' — ' + esc(zi.status) : '') + '.</b><span class="muted tiny" style="margin-left:8px">Checked at ' + esc(when) + ' · ' + again + '</span></div>';
+}
+
+function renderReady() {
+  $('#ready-banner').innerHTML = readyHtml(S.readiness, 'run');
+  if (isAdmin()) $('#ready-setup').innerHTML = readyHtml(S.readiness, 'setup');
+  const blocked = readyBlocked();
+  if ($('#start')) { $('#start').disabled = blocked || !picked.size; $('#start-basic').disabled = blocked || !picked.size; }
+  $$('.ready-recheck').forEach((b) => b.onclick = async () => {
+    b.disabled = true; b.textContent = 'checking…';
+    const r = await api('/api/readiness?fresh=1');
+    S.readiness = r.readiness; renderReady(); renderNav();
+  });
+}
+async function loadReady(fresh) {
+  const r = await api('/api/readiness' + (fresh ? '?fresh=1' : ''));
+  S.readiness = r.readiness; renderReady(); renderNav();
+}
+
 /* ---------------------------------------------------------- live stream */
 const es = new EventSource('/api/events');
 es.onopen = () => setDot('live', 'Connected.');
@@ -1397,10 +1459,11 @@ es.onmessage = (e) => {
   else if (m.type === 'status') $('#foot').textContent = String(m.msg).slice(0, 90);
   else if (m.type === 'leads') { S.leads = m.leads; renderPicker(); }
   else if (m.type === 'preflight') { S.preflight = m.preflight; if (isAdmin()) renderSetup(); renderNav(); }
+  else if (m.type === 'readiness') { S.readiness = m.readiness; renderReady(); renderNav(); }
 };
 
 window.go = go;
-load().then(initZoho);
+load().then(initZoho).then(() => loadReady(false));
 </script>
 </body>
 </html>

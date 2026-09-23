@@ -1539,6 +1539,137 @@ function runClaudeNow(prompt, { label, timeoutMin, logFile, onEvent, cwd, model,
   });
 }
 
+// ---------------------------------------------------------------- readiness
+// The two connections a profile cannot do without: Zoho, where every finished
+// profile has to land, and ZoomInfo, where the roster and its phone numbers come
+// from. Both are checked before a run is allowed to start, again before a
+// write-back, and every few minutes while a dashboard is open. A broken
+// connection shows up as a notice on the Run screen with the reason and the fix,
+// and the Start buttons stay off — instead of a run that spends a session per
+// lead and then has nowhere to write, or comes back with no phone numbers.
+
+let readiness = { at: 0, ok: false, checks: { zoho: null, zoominfo: null }, issues: [], warnings: [] };
+let readinessPending = null;
+const READY_TTL_MS = 60_000;          // a check this fresh is reused by the run gate
+const READY_POLL_MS = 5 * 60_000;     // the background monitor's cadence
+
+// `claude mcp list` is the CLI's own health check: it contacts every registered MCP
+// server and prints one line per server — "zoominfo: <url> (HTTP) - ✓ Connected",
+// "… - ✗ Failed to connect — <reason>" or "… - ⚠ Needs authentication". Spawned
+// without a shell and with stdin closed, so a stuck check can be killed cleanly.
+function mcpList(timeoutMs = 45_000) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      const [cmd, ...cmdArgs] = parseCmd(config.claudeCmd);
+      child = spawn(cmd, [...cmdArgs, 'mcp', 'list'], { cwd: RUNS, stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+    } catch (err) {
+      return resolve({ ok: false, out: '', error: `Could not start "${config.claudeCmd}": ${err.message}` });
+    }
+    let out = '', done = false;
+    const finish = (r) => { if (done) return; done = true; clearTimeout(timer); resolve(r); };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      finish({ ok: false, out: out.trim(), error: `"${config.claudeCmd} mcp list" did not answer within ${Math.round(timeoutMs / 1000)} seconds` });
+    }, timeoutMs);
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (out += d));
+    child.on('error', (err) => finish({ ok: false, out: out.trim(), error: `Could not start "${config.claudeCmd}": ${err.message}` }));
+    child.on('close', (code) => finish({ ok: code === 0, out: out.trim().slice(0, 8000), error: code === 0 ? null : `"${config.claudeCmd} mcp list" exited with code ${code}` }));
+  });
+}
+
+function parseMcpList(out) {
+  const servers = [];
+  for (const raw of String(out || '').split('\n')) {
+    const line = raw.replace(/\x1b\[[0-9;]*m/g, '').trim();
+    const m = line.match(/^([A-Za-z0-9_.-]+):\s+(.*?)\s+-\s+(.*)$/);
+    if (m) servers.push({ name: m[1], target: m[2], status: m[3].trim() });
+  }
+  return servers;
+}
+
+const ZI_LOGIN_FIX = 'From a shell in the running container, sign the server into ZoomInfo again with `claude mcp login zoominfo --no-browser` as the app user (README → "ZoomInfo on the server"), then run Preflight under Setup.';
+
+async function checkZoomInfo() {
+  const r = await mcpList();
+  const servers = parseMcpList(r.out);
+  const zi = servers.find((s) => /zoominfo/i.test(s.name));
+  if (!zi) {
+    if (!r.ok && !servers.length && !/No MCP servers configured/i.test(r.out)) {
+      return { ok: false, status: null, error: `Could not check ZoomInfo — ${r.error}${r.out ? ` (${r.out.split('\n')[0].slice(0, 160)})` : ''}.`,
+        fix: 'The Claude CLI on the server is not answering, so no session would start either. Check the Claude command under Setup → Settings and the deploy logs.' };
+    }
+    return { ok: false, status: null, error: 'ZoomInfo is not registered as an MCP server on this server, so no profile could reach it.',
+      fix: 'Register it once with `claude mcp add --transport http -s user zoominfo https://mcp.zoominfo.com/mcp`, then ' + ZI_LOGIN_FIX.charAt(0).toLowerCase() + ZI_LOGIN_FIX.slice(1) };
+  }
+  const st = zi.status;
+  if (/connected/i.test(st) && !/not connected|failed|needs auth/i.test(st)) return { ok: true, status: st, error: null, fix: null };
+  if (/needs auth/i.test(st)) {
+    return { ok: false, status: st, error: 'ZoomInfo’s sign-in on the server has expired or was never completed, so every profile would come back without ZoomInfo data — no roster, no phone numbers.', fix: ZI_LOGIN_FIX };
+  }
+  return { ok: false, status: st, error: `The server cannot reach ZoomInfo right now: ${st.replace(/^[^A-Za-z0-9]+/, '').replace(/\.+$/, '')}.`,
+    fix: 'If ZoomInfo itself is up, check the server’s outbound network. If it keeps failing, ' + ZI_LOGIN_FIX.charAt(0).toLowerCase() + ZI_LOGIN_FIX.slice(1) };
+}
+
+async function checkZoho() {
+  const credFix = 'Check the client ID, secret and refresh token under Setup → Zoho connection (or the ZOHO_* variables on the server) and press Save & verify. A refresh token stops working the moment a new one is generated for the same client.';
+  if (!zohoConfigured()) {
+    return { ok: false, error: 'Zoho is not connected, so a finished profile would have nowhere to go.',
+      fix: 'Connect Zoho under Setup → Zoho connection, or set ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN on the server.' };
+  }
+  try {
+    await zohoAccessToken();
+    const res = await zohoApi('/crm/v8/org');
+    if (res.status >= 400) return { ok: false, error: `Zoho refused the connection: ${zohoErrText(res)}.`, fix: credFix };
+    const scope = tokenCache.scope || '';
+    if (scope && !WRITE_SCOPE_RE.test(scope)) {
+      return { ok: false, scope, error: `Zoho answers, but this token cannot write to Leads (granted scopes: ${scope}), so nothing could be written back.`,
+        fix: 'Generate a new refresh token with the scope ZohoCRM.modules.ALL and paste it under Setup → Zoho connection.' };
+    }
+    const org = (res.json && res.json.org && res.json.org[0]) || null;
+    return { ok: true, scope, org: org ? (org.company_name || org.primary_email || null) : null, error: null, fix: null };
+  } catch (err) {
+    return { ok: false, error: `Zoho refused the connection: ${err.message.replace(/\.$/, '')}.`, fix: credFix };
+  }
+}
+
+/**
+ * The current readiness, re-checked when the last answer is older than maxAge.
+ * Concurrent callers share one check. Every change of state is pushed to every
+ * open dashboard, so the notice appears the moment a connection breaks and goes
+ * away the moment it is fixed.
+ */
+async function checkReadiness({ maxAge = READY_TTL_MS } = {}) {
+  if (readiness.at && Date.now() - readiness.at < maxAge) return readiness;
+  if (readinessPending) return readinessPending;
+  readinessPending = (async () => {
+    const [zoho, zoominfo] = await Promise.all([checkZoho(), checkZoomInfo()]);
+    const issues = [];
+    if (!zoho.ok) issues.push({ key: 'zoho', title: 'Zoho cannot take the write-back', detail: zoho.error, fix: zoho.fix });
+    if (!zoominfo.ok) issues.push({ key: 'zoominfo', title: 'ZoomInfo is not connected', detail: zoominfo.error, fix: zoominfo.fix });
+    const warnings = [];
+    if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
+      warnings.push({ key: 'claude', title: 'No Claude sign-in on the server', detail: 'Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set, so profiling sessions may not be able to sign in.',
+        fix: 'Run `claude setup-token` on a machine signed in to the company’s Claude account and set CLAUDE_CODE_OAUTH_TOKEN on the server.' });
+    }
+    const next = { at: Date.now(), ok: !issues.length, checks: { zoho, zoominfo }, issues, warnings };
+    const changed = !readiness.at || next.ok !== readiness.ok || JSON.stringify(next.issues) !== JSON.stringify(readiness.issues);
+    readiness = next;
+    if (changed) {
+      emit('readiness', { readiness });
+      if (!next.ok) emit('status', { msg: `Profiling paused — ${next.issues.map((i) => i.title).join('; ')}.` });
+      else console.log(`  Readiness: Zoho and ZoomInfo connected.`);
+      if (!next.ok) console.warn(`  Readiness: profiling paused — ${next.issues.map((i) => `${i.title}: ${i.detail}`).join(' | ')}`);
+    }
+    return readiness;
+  })().finally(() => { readinessPending = null; });
+  return readinessPending;
+}
+// Anything that changes what the checks would see (new Zoho credentials, another
+// Claude command) throws the cached answer away.
+const invalidateReadiness = () => { readiness = { ...readiness, at: 0 }; };
+
 // ---------------------------------------------------------------- prompts
 
 // The skill is bundled inside this folder so headless sessions never hunt for it.
@@ -2428,6 +2559,7 @@ const server = http.createServer(async (req, res) => {
       });
       res.write(': connected\n\n');
       clients.set(res, user.id);
+      checkReadiness().catch(() => {});
       const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
       req.on('close', () => { clearInterval(ping); clients.delete(res); });
       return;
@@ -2452,7 +2584,7 @@ const server = http.createServer(async (req, res) => {
         config: cfg, segments, preflight: state.preflight,
         leads: us.leads, activeSegment: us.activeSegment,
         run: publicRun(us.run), stats: computeStats({ userId: user.id }),
-        liveSessions,
+        liveSessions, readiness,
       });
     }
 
@@ -2466,6 +2598,7 @@ const server = http.createServer(async (req, res) => {
       const allowed = ['pepm', 'concurrency', 'basicConcurrency', 'basicTimeoutMin', 'maxSessions', 'claudeCmd', 'model',
         'fallbackModel', 'utilityModel', 'perLeadTimeoutMin', 'maxCostFull', 'maxCostBasic', 'maxToolCallsFull', 'maxToolCallsBasic',
         'idleKillMin', 'fallbackToBasic'];
+      const prevCmd = config.claudeCmd;
       for (const k of allowed) if (body[k] !== undefined) config[k] = body[k];
       config.concurrency = Math.max(1, Math.min(8, Number(config.concurrency) || 3));
       config.basicConcurrency = Math.max(1, Math.min(40, Number(config.basicConcurrency) || 20));
@@ -2480,6 +2613,7 @@ const server = http.createServer(async (req, res) => {
       config.fallbackToBasic = config.fallbackToBasic !== false && config.fallbackToBasic !== 'false';
       for (const k of ['model', 'fallbackModel', 'utilityModel', 'claudeCmd']) config[k] = String(config[k] || '').trim();
       if (!config.claudeCmd) config.claudeCmd = 'claude';
+      if (config.claudeCmd !== prevCmd) invalidateReadiness();
       writeJSON(CONFIG_PATH, config);
       // Let anyone queued behind an old cap through if it just went up.
       while (sessionWaiters.length && liveSessions < config.maxSessions) { liveSessions++; sessionWaiters.shift()(); }
@@ -2568,10 +2702,13 @@ const server = http.createServer(async (req, res) => {
         refreshToken: (body.refreshToken || '').trim() || zoho.refreshToken,
       };
       writeJSON(ZOHO_PATH, zoho);
-      tokenCache = { token: null, expiresAt: 0 };
+      tokenCache = { token: null, expiresAt: 0, scope: '' };
       metaCache = { at: 0, value: null };
       zohoUsersCache = { at: 0, value: null };
-      return send(res, 200, await zohoStatus());
+      invalidateReadiness();
+      const status = await zohoStatus();
+      checkReadiness({ maxAge: 0 }).catch(() => {});
+      return send(res, 200, status);
     }
 
     if (p === '/api/zoho/write-check') {
@@ -2626,6 +2763,12 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // -- readiness: can a run actually finish? --
+    if (p === '/api/readiness') {
+      const fresh = url.searchParams.get('fresh') === '1';
+      return send(res, 200, { readiness: await checkReadiness(fresh ? { maxAge: 0 } : {}) });
+    }
+
     // -- claude side --
     if (p === '/api/connection') {
       if (!admin) return forbidden();
@@ -2639,7 +2782,7 @@ const server = http.createServer(async (req, res) => {
         setTimeout(() => { try { c.kill(); } catch {} }, 20000);
       });
       const cli = await sh(`${config.claudeCmd} --version`);
-      const mcp = cli.ok ? await sh(`${config.claudeCmd} mcp list`) : { ok: false, out: '' };
+      const mcp = cli.ok ? await mcpList() : { ok: false, out: '' };
       return send(res, 200, { cli, mcp, tokenSet: !!process.env.CLAUDE_CODE_OAUTH_TOKEN || !!process.env.ANTHROPIC_API_KEY, liveSessions, maxSessions: config.maxSessions });
     }
 
@@ -2707,6 +2850,13 @@ const server = http.createServer(async (req, res) => {
       const mode = body.mode === 'basic' ? 'basic' : 'full';
       if (mode === 'full' && chosen.length > 50) return send(res, 400, { error: 'Fifty leads per comprehensive run at most. Use Basic profile for a larger sweep.' });
       if (mode === 'basic' && chosen.length > 300) return send(res, 400, { error: 'Three hundred leads per basic run at most.' });
+      // Nothing starts unless the run could finish: Zoho has to be reachable and
+      // writable, and ZoomInfo signed in. Otherwise every lead would spend a session
+      // and come back with nowhere to go — the exact waste this gate exists to stop.
+      const ready = await checkReadiness();
+      if (!ready.ok) {
+        return send(res, 503, { error: 'blocked', message: `Profiling is paused: ${ready.issues.map((i) => i.detail).join(' ')}`, readiness: ready });
+      }
       // A lead profiled in the last week costs a full lead's worth of credits to do
       // again. Say so once and let the person insist.
       if (!body.force) {
@@ -2735,6 +2885,13 @@ const server = http.createServer(async (req, res) => {
       const run = us.run;
       const jobs = (run?.jobs || []).filter((j) => ids.includes(j.leadId) && j.result && !j.written);
       if (!jobs.length) return send(res, 400, { error: 'Nothing approved to write.' });
+      // A write that cannot land is refused with the reason rather than attempted:
+      // a half-failed batch is far harder to sort out than a paused one.
+      const ready = await checkReadiness();
+      const zohoReady = ready.checks && ready.checks.zoho;
+      if (!zohoReady || !zohoReady.ok) {
+        return send(res, 503, { error: `Nothing was written. ${zohoReady ? zohoReady.error : 'Zoho is not ready.'}`, readiness: ready });
+      }
       send(res, 200, { queued: jobs.length });
 
       const direct = zohoConfigured();
@@ -2804,4 +2961,9 @@ server.listen(PORT, '0.0.0.0', () => {
   if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
     console.warn('  WARNING: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set. Profiling sessions will not be able to sign in.\n');
   }
+  // The first readiness answer is ready by the time anyone opens a dashboard, and
+  // the monitor keeps it current so a connection that breaks mid-day is announced
+  // within minutes rather than discovered by a failed run.
+  setTimeout(() => checkReadiness().catch(() => {}), 1500);
+  setInterval(() => checkReadiness({ maxAge: 0 }).catch(() => {}), READY_POLL_MS);
 });
