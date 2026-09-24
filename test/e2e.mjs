@@ -80,6 +80,15 @@ assert.equal(s.run.jobs[0].result.contact.firstName, 'Pat'); assert.equal(s.run.
   assert.equal(r0.fields.HCM, undefined); assert.equal(r0.fields.Website, undefined); assert.equal(r0.fields.Employee_Count, 40); ok('normalizer: absence values and empty fields dropped');
   assert.equal(r0.leadership.length, 5); assert.equal(r0.leadershipPhones, 4); assert.equal(r0.coverage.leadershipPhones, true); ok('normalizer: leadership roster kept (nameless entry dropped), phones counted');
   assert.equal(s.run.jobs[0].mode, 'full'); assert.equal(s.run.jobs[0].attempts.length, 1); ok('job carries its mode and one attempt');
+  // The session started from the whole Zoho record, anchored on its website.
+  const l = s.run.jobs[0].lead;
+  assert.equal(l.website, 'https://www.alpha-care.example/'); assert.equal(l.record.street, '1 Main St'); assert.equal(l.record.companyPhone, '(718) 555-0100'); assert.equal(l.record.parent, 'Alpha Holdings LLC');
+  assert.ok(zohoStub.state.recordReads.includes('5001')); ok('the full Zoho record was read before the session and folded into the lead');
+  assert.ok(s.run.jobs[0].progress.some((p) => /Read the full Zoho record — anchoring on domain alpha-care.example, street address, HQ phone, ZoomInfo profile/.test(p.msg))); ok('…and the live feed says what it anchored on');
+  const prompt = fs.readFileSync(path.join(STORE, 'prompts', '5001.full.txt'), 'utf8');
+  assert.match(prompt, /STEP 0 — LOCK THE IDENTITY BEFORE ANY SEARCH/); assert.match(prompt, /the website domain alpha-care.example — the strongest anchor/); assert.match(prompt, /Street address: 1 Main St, Brooklyn, NY 11201/);
+  assert.match(prompt, /Company phone \(HQ\): \(718\) 555-0100/); assert.match(prompt, /area code 718/); assert.match(prompt, /ZoomInfo company profile: https:\/\/www.zoominfo.com\/c\/alpha-care\/1/); assert.match(prompt, /Ultimate parent on record: Alpha Holdings LLC/);
+  assert.match(prompt, /companyWebsite "alpha-care.example"/); assert.match(prompt, /site:alpha-care.example/); ok('the prompt carries every anchor and the identity-lock step, keyed on the domain');
 }
 assert.ok(fs.existsSync(path.join(STORE, 'runs', runId, '5001.json'))); ok('result JSON persisted on the volume');
 r = await call('admin', '/api/state'); assert.equal(r.json.run, null); ok("admin's own run state is untouched by the rep's run");
@@ -90,6 +99,15 @@ assert.equal(zohoStub.state.writes.length, 1); assert.equal(zohoStub.state.write
 assert.ok(zohoStub.state.notes.some((n) => n.leadId === '5001' && n.Note_Title === 'PAYROLL FINDINGS')); ok('…and it landed in the CRM as a field update plus notes');
 const reviewIds = (st) => st.review.map((j) => j.leadId).sort();
 assert.deepEqual(reviewIds(s), ['5001', '5002']); assert.equal(s.review.find((j) => j.leadId === '5001').written, true); ok('review queue: the written lead still shows its tick, the other waits');
+// A session that drifts to a look-alike company is caught by the server: its website is not the record's.
+r = await call('rep', '/api/run', { leads: [{ id: '5101', company: 'Drift Co', owner: { id: '999' } }] }); assert.equal(r.status, 200); const driftRun = r.json.runId;
+s = await pollRun('rep', (x) => x.run && x.run.id === driftRun && x.run.finishedAt, 100);
+{
+  const j = s.run.jobs[0]; assert.equal(j.status, 'done');
+  assert.deepEqual(j.result.identityMismatch, { record: 'alpha-care.example', found: 'drift-co-ohio.example' });
+  assert.match(j.result.needsHuman, /website \(drift-co-ohio.example\) is not the one on the Zoho record \(alpha-care.example\)/); assert.equal(j.result.fields.Website, undefined); ok('a profile whose website is not the record\'s is flagged for a human and its website is not written');
+  r = await call('rep', '/api/review/discard', { leadIds: ['5101'] }); assert.equal(r.json.removed, 1);
+}
 
 // 5a. Hard stops and the fallback ladder
 r = await call('rep', '/api/run', { leads: [{ id: '5501', company: 'Runaway Inc', owner: { id: '999' } }, { id: '5502', company: 'Gamma LLC', owner: { id: '999' } }] });
@@ -103,6 +121,7 @@ s = await pollRun('rep', (x) => x.run && x.run.id === runawayRun && x.run.finish
   const h = await fetch(BASE + '/healthz').then((x) => x.json()); assert.equal(h.liveSessions, 0); assert.equal(h.liveProcesses, 0); ok('no session slot or process leaked after the kill');
   // The queue: the unwritten lead from the first run is still in Review, the written one is not.
   assert.deepEqual(reviewIds(s), ['5002', '5501', '5502']); ok('review queue keeps the earlier run\'s unwritten lead alongside the new run');
+  assert.match(fs.readFileSync(path.join(STORE, 'prompts', '5501.basic.txt'), 'utf8'), /LOCK THE IDENTITY[\s\S]*companyWebsite "alpha-care.example", companyName "Runaway Inc"/); ok('the basic prompt keys its ZoomInfo calls on the domain too');
   assert.equal(s.review[0].runId, runawayRun); assert.equal(s.review.find((x) => x.leadId === '5002').runId, runId); ok('…newest run first, each row tagged with its run');
 }
 // 5a'. Re-profiling a queued lead replaces its older waiting result; removing a lead takes it out without a write.
@@ -141,8 +160,8 @@ assert.equal(r.status, 400); assert.match(r.json.error, /Basic profile/); ok('51
 
 // 6. Stats
 r = await call('rep', '/api/stats?scope=all'); assert.equal(r.status, 403); ok('rep cannot see everyone stats');
-r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 31); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
-assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 5); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
+r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 32); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
+assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 6); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
 r = await call('admin', '/api/stats'); assert.equal(r.json.totalLeads, 0); ok("admin's own stats are separate");
 
 // 6a. The readiness gate: nothing runs while Zoho cannot take the write-back or

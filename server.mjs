@@ -1832,16 +1832,112 @@ Output ONLY a fenced json block, no prose:
 
 // The lead extract every mode gets. Everything the picker already pulled from Zoho
 // goes in, so a session never spends a call re-reading the record.
+// ---- the whole Zoho record, read before the session starts --------------------
+// The picker row carries nine columns. The record carries the things that pin
+// down WHICH company this is — website, email domain, street address, HQ phone,
+// the ZoomInfo and LinkedIn profile URLs, the parent entity. A session that only
+// had the name and the city drifted to same-named companies elsewhere; this reads
+// everything first and hands it over as the anchor for every search.
+const domainOf = (v) => {
+  const s = cleanStr(v).toLowerCase();
+  if (!s) return '';
+  const m = s.replace(/^[a-z]+:\/\//, '').replace(/^www\./, '').match(/^[a-z0-9.-]+\.[a-z]{2,}/);
+  return m ? m[0] : '';
+};
+const emailDomainOf = (v) => { const s = cleanStr(v).toLowerCase(); const at = s.lastIndexOf('@'); return at > 0 ? s.slice(at + 1) : ''; };
+const areaCode = (v) => { const d = cleanStr(v).replace(/\D/g, '').replace(/^1(?=\d{10}$)/, ''); return d.length >= 10 ? d.slice(0, 3) : ''; };
+
+async function zohoLeadRecord(id) {
+  if (!zohoConfigured()) return null;
+  try {
+    const r = await zohoApi(`/crm/v8/Leads/${encodeURIComponent(String(id))}`);
+    const rec = r.status < 400 && r.json && Array.isArray(r.json.data) ? r.json.data[0] : null;
+    return rec && typeof rec === 'object' ? rec : null;
+  } catch { return null; }
+}
+
+// Fold the record into the browsed row: the row's values win only where the record
+// is empty (they came from the same record moments ago), and the identity fields
+// the row never carried are added under `record`.
+function enrichLeadFromRecord(lead, rec) {
+  const v = (k) => { const x = rec[k]; return x == null ? '' : (typeof x === 'object' ? (x.name || x.id || '') : String(x)).trim(); };
+  const first = (...ks) => ks.map(v).find(Boolean) || '';
+  lead.company = first('Company') || lead.company;
+  lead.contact = [v('First_Name'), v('Last_Name')].filter(Boolean).join(' ') || lead.contact;
+  lead.title = v('Designation') || lead.title;
+  lead.website = v('Website') || lead.website;
+  lead.email = v('Email') || lead.email;
+  lead.phone = v('Phone') || lead.phone;
+  lead.mobile = v('Mobile') || lead.mobile;
+  lead.city = v('City') || lead.city;
+  lead.state = v('State') || lead.state;
+  lead.industry = v('Industry') || lead.industry;
+  if (lead.employees == null && rec.Employee_Count != null && rec.Employee_Count !== '') lead.employees = rec.Employee_Count;
+  lead.record = {
+    street: v('Street'), zip: v('Zip_Code'), fullAddress: v('Full_Address'), country: v('Country'),
+    companyPhone: v('Company_Number'), emailDomain: v('Email_Domain') || emailDomainOf(lead.email),
+    description: v('Description').slice(0, 600),
+    ziCompanyUrl: v('ZoomInfo_Company_Profile_URL'), ziContactUrl: v('ZoomInfo_Contact_Profile_URL'),
+    linkedinCompany: v('LinkedIn_Company_Profile_URL'), facebook: v('Facebook_Company_Profile_URL'), linkedinContact: v('Linkedin'),
+    parent: v('Entity_Name_Ultimate_Parent'), leadSource: v('Lead_Source'), secondaryEmail: v('Secondary_Email'),
+    hcm: first('HCM', 'HRM'), provider: first('Current_PR_Provider_new', 'Current_Payroll_Service'),
+    profiledDate: v('Profiled_Date'), profileType: v('Profile_Type'),
+  };
+  return lead;
+}
+
 function leadBlock(lead) {
+  const r = lead.record || {};
+  const domain = domainOf(lead.website);
+  const emailDomain = r.emailDomain || emailDomainOf(lead.email);
+  const codes = Array.from(new Set([lead.phone, lead.mobile, r.companyPhone].map(areaCode).filter(Boolean)));
+  const line = (label, val) => (val ? `- ${label}: ${val}\n` : '');
   return `- Zoho record id: ${lead.id}
 - Company: ${lead.company}
+- Website: ${lead.website || '(none on record)'}${domain ? ` — domain ${domain}` : ''}
 - On record: ${lead.contact || '(none)'} ${lead.title ? `— ${lead.title}` : ''}
 - Location: ${[lead.city, lead.state].filter(Boolean).join(', ') || '(unknown)'}
-- Industry on record: ${lead.industry || '(unknown)'}
-- Website: ${lead.website || '(none on record)'}
-- Email on record: ${lead.email || '(none)'} · Phone on record: ${lead.phone || '(none)'} · Mobile on record: ${lead.mobile || '(none)'}
+` + line('Street address', [[r.street, lead.city].filter(Boolean).join(', '), [lead.state, r.zip].filter(Boolean).join(' ')].filter(Boolean).join(', ') || r.fullAddress)
+    + line('Company phone (HQ)', r.companyPhone)
+    + `- Email on record: ${lead.email || '(none)'}${emailDomain ? ` — domain ${emailDomain}` : ''} · Phone on record: ${lead.phone || '(none)'} · Mobile on record: ${lead.mobile || '(none)'}${codes.length ? ` · area code${codes.length === 1 ? '' : 's'} ${codes.join(', ')}` : ''}
+`   + line('ZoomInfo company profile', r.ziCompanyUrl)
+    + line('ZoomInfo contact profile', r.ziContactUrl)
+    + line('LinkedIn company page', r.linkedinCompany)
+    + line('LinkedIn of the person on record', r.linkedinContact)
+    + line('Facebook page', r.facebook)
+    + line('Ultimate parent on record', r.parent)
+    + `- Industry on record: ${lead.industry || '(unknown)'}
 - Employee count on record (ZoomInfo import, unverified): ${lead.employees ?? '(none)'}
-- Lead owner: ${(lead.owner && lead.owner.name) || '(unknown)'}`;
+`   + line('Payroll provider already on record', r.provider)
+    + line('HR system already on record', r.hcm)
+    + line('Lead source', r.leadSource)
+    + line('Description already on record', r.description ? r.description.replace(/\s+/g, ' ') : '')
+    + `- Lead owner: ${(lead.owner && lead.owner.name) || '(unknown)'}`
+    + (lead.record ? '' : '\n- (The full Zoho record could not be read for this run; the lines above are the browsed row.)');
+}
+
+// The rule that keeps a session on THIS company. Written once, sent with both
+// prompts, and phrased around the anchors the record actually has.
+function identityLock(lead) {
+  const r = lead.record || {};
+  const domain = domainOf(lead.website);
+  const emailDomain = r.emailDomain || emailDomainOf(lead.email);
+  const place = [lead.city, lead.state].filter(Boolean).join(', ');
+  const anchors = [
+    domain && `the website domain ${domain} — the strongest anchor there is`,
+    emailDomain && emailDomain !== domain && `the email domain ${emailDomain}`,
+    r.ziCompanyUrl && `the ZoomInfo company profile on record`,
+    (r.street || r.companyPhone) && `the street address and HQ phone on record`,
+    place && `the location ${place}`,
+    r.parent && `the parent entity ${r.parent}`,
+    lead.contact && `${lead.contact}${lead.title ? ` (${lead.title})` : ''} being someone who works there`,
+  ].filter(Boolean);
+  return `STEP 0 — LOCK THE IDENTITY BEFORE ANY SEARCH. The Zoho record above says WHICH company this is; your job is to research that company and no other. Anchors, strongest first: ${anchors.length ? anchors.join('; ') : 'the name and whatever else the record holds'}.
+- Every company you take a fact from — a ZoomInfo company row, a search hit, a LinkedIn page, a news item, a state filing — must match an anchor first. Same or similar name in another city, state or industry, or on another domain, means a DIFFERENT company: ignore it completely and never blend its facts into this profile.
+${domain ? `- Key every lookup by the domain, not the name: ZoomInfo enrich_companies with companyWebsite "${domain}" (companyName only as a secondary field), search_contacts with companyWebsite "${domain}", WebSearch qualified with site:${domain} or with "${lead.company}" ${place || ''}. Fetch ${lead.website} first and confirm the site is this company (name, ${place || 'location'}, phone) before anything else.`
+  : `- No website on record, so establish it first: ONE WebSearch "${lead.company}" ${place || ''}${r.companyPhone ? ` OR "${r.companyPhone}"` : ''} — accept a candidate only when its address, phone or the person on record matches the Zoho record, then use that domain for every lookup that follows.`}
+- If a ZoomInfo company row or a website you fetched contradicts the anchors (different city and state, different domain, different phone), it is the wrong company — drop it, do not "correct" the record to match it.
+- If you cannot confirm which company this is, stop researching: return what the record says, leave the unconfirmed fields out, and set "needsHuman" to one sentence starting "Could not confirm the company's identity:". Never guess and never profile a look-alike.`;
 }
 
 // The output shape, described once for the model in words the rulebook uses. The
@@ -1876,6 +1972,8 @@ function profilePrompt(lead, opts = {}) {
 
 LEAD — this is the complete relevant extract of the Zoho record, current as of this run. Do NOT call getRecord and do NOT re-read this lead from Zoho; start from what is below:
 ${leadBlock(lead)}
+
+${identityLock(lead)}
 
 THE JOB: verify the contact and settle who the top decision-maker is; build the leadership roster with phone numbers; research the company through the four rounds; write the Description, the notes and the icebreakers. No scoring of any kind — no fit score, tier, temperature, confidence rating or deal value. Report facts, sources and dates and let the rep judge.
 
@@ -1949,10 +2047,12 @@ ${why}
 COMPANY — this is the Zoho lead record, current as of this run. Do NOT re-read it from Zoho:
 ${leadBlock(lead)}
 
+${identityLock(lead)}
+
 THE SIX FACTS AND THE ONE WAY TO GET EACH:
-1. WHAT THEY ARE — nursing home, home care agency, manufacturer, charter school, etc. Method: the company website home page (WebFetch). No website on record: ONE WebSearch for "${lead.company}" ${lead.state || ''} and use the first result that is clearly them.
-2. OWNERSHIP AND THE LEADERSHIP ROSTER — who owns it (a single owner, partners, a family, a private-equity group, a public company, a nonprofit board) and every owner and C-level person you can name: CEO, President, CFO, COO, other chiefs. Method: ONE ZoomInfo contact search on the company — mcp__claude_ai_ZoomInfo__search_contacts with companyName "${lead.company}"${lead.website ? ` (or companyWebsite "${lead.website}")` : ''}, managementLevelList ["C Level Exec", "VP Level Exec"], sort "-contactAccuracyScore", pageSize 10. "Owner" is NOT a valid management level; owners, founders, partners and principals usually carry a C-level title in ZoomInfo and this search returns them. Do not pass jobTitleList together with managementLevelList. Keep the personId of every row — fact 6 needs them. If the website has an about or leadership page and you already fetched the site, read the names off that too, but do not go looking for more.
-3. EMPLOYEE COUNT — Method: ONE ZoomInfo company enrichment — mcp__claude_ai_ZoomInfo__enrich_companies with companies [{ companyName "${lead.company}"${lead.website ? `, companyWebsite "${lead.website}"` : ''} }] and requiredFields ["name","website","employeeCount","employeeRange","street","city","state","zipCode","phone","locationCount","ultimateParentName","parentName","type","description","socialMediaUrls"]. Without requiredFields the tool returns no headcount and no address, so always pass that list. Two special cases:
+1. WHAT THEY ARE — nursing home, home care agency, manufacturer, charter school, etc. Method: the company website home page (WebFetch ${lead.website || 'the site established in step 0'}); this fetch is also the identity check in step 0. No website on record: the ONE WebSearch from step 0, "${lead.company}" ${[lead.city, lead.state].filter(Boolean).join(' ')}, and use the result whose address or phone matches the record — not merely the first hit with that name.
+2. OWNERSHIP AND THE LEADERSHIP ROSTER — who owns it (a single owner, partners, a family, a private-equity group, a public company, a nonprofit board) and every owner and C-level person you can name: CEO, President, CFO, COO, other chiefs. Method: ONE ZoomInfo contact search on the company — mcp__claude_ai_ZoomInfo__search_contacts with ${domainOf(lead.website) ? `companyWebsite "${domainOf(lead.website)}" (the domain pins the company; add companyName "${lead.company}" only as a second field)` : `companyName "${lead.company}" — and check the rows' company location against ${[lead.city, lead.state].filter(Boolean).join(', ') || 'the record'} before using them`}, managementLevelList ["C Level Exec", "VP Level Exec"], sort "-contactAccuracyScore", pageSize 10. "Owner" is NOT a valid management level; owners, founders, partners and principals usually carry a C-level title in ZoomInfo and this search returns them. Do not pass jobTitleList together with managementLevelList. Keep the personId of every row — fact 6 needs them. If the website has an about or leadership page and you already fetched the site, read the names off that too, but do not go looking for more.
+3. EMPLOYEE COUNT — Method: ONE ZoomInfo company enrichment — mcp__claude_ai_ZoomInfo__enrich_companies with companies [{ ${domainOf(lead.website) ? `companyWebsite "${domainOf(lead.website)}", companyName "${lead.company}"` : `companyName "${lead.company}"`} }] and requiredFields ["name","website","employeeCount","employeeRange","street","city","state","zipCode","phone","locationCount","ultimateParentName","parentName","type","description","socialMediaUrls"]. Without requiredFields the tool returns no headcount and no address, so always pass that list. Two special cases:
    - HOME CARE / HOME HEALTH / STAFFING: the ZoomInfo number is usually the office and the real workforce is in the field. Do ONE extra WebSearch: "${lead.company}" caregivers OR aides OR nurses OR employees — and if the company or a news item states a field-staff figure, report office and field separately.
    - NURSING HOME / ASSISTED LIVING / ANY MULTI-FACILITY GROUP: count the whole group. Do ONE extra WebSearch: "${lead.company}" facilities OR locations OR "skilled nursing" — and report the number of facilities and the group-wide headcount (sum the facilities if a per-facility figure is what you find, and say it is a sum).
 4. HCM / HRIS / ATS — what system their job applications run on. Method: fetch the careers or jobs page (WebFetch the careers link from the home page, or {website}/careers) and read the host of the apply links. myworkdayjobs.com = Workday, greenhouse.io = Greenhouse, lever.co = Lever, icims.com = iCIMS, ultipro.com or ukg.com = UKG, paylocity.com = Paylocity, paycomonline.net = Paycom, paycor.com = Paycor, adp.com or workforcenow = ADP, bamboohr.com = BambooHR, applytojob.com = JazzHR, jobvite.com = Jobvite, smartrecruiters.com = SmartRecruiters, ashbyhq.com = Ashby, workable.com = Workable, isolvedhire or isolved = isolved, apploi.com = Apploi, hireology.com = Hireology, indeed-hosted or a plain email/web form = none. If there is no careers page, ONE WebSearch: site:indeed.com OR site:linkedin.com/jobs "${lead.company}" and read the apply destination of one posting. For a multi-facility group, check a second facility's posting if it is right there in the results; do not tour every facility.
@@ -2175,6 +2275,16 @@ function normalizeProfile(raw, lead, mode) {
     if (out.fields.Current_PR_Provider_new) out.coverage.provider = true;
     if (out.employees != null) out.coverage.headcount = true;
   }
+  // The one drift the server can catch on its own: a result whose website is not
+  // the record's website is very likely a look-alike company. It is flagged for a
+  // human rather than written, and the record's website is never overwritten by it.
+  const recDomain = domainOf(lead.website), gotDomain = domainOf(out.fields.Website);
+  if (recDomain && gotDomain && recDomain !== gotDomain && !recDomain.endsWith('.' + gotDomain) && !gotDomain.endsWith('.' + recDomain)) {
+    const msg = `The profile's website (${gotDomain}) is not the one on the Zoho record (${recDomain}) — check that this is the same company before writing.`;
+    out.needsHuman = out.needsHuman ? `${out.needsHuman} ${msg}` : msg;
+    out.identityMismatch = { record: recDomain, found: gotDomain };
+    delete out.fields.Website;
+  }
   const roster = leadershipRoster(out);
   out.leadershipPhones = roster.filter((p) => p.directPhone || p.mobilePhone).length;
   out.leadershipCount = roster.length;
@@ -2286,6 +2396,20 @@ async function startRun(user, leads, pepm, mode = 'full') {
     job.startedAt = Date.now();
     emit('job', { job: publicJob(job) }, user.id);
 
+    // The whole record first, so the session starts from every identifying fact
+    // Zoho holds — not the nine picker columns.
+    const rec = await zohoLeadRecord(job.leadId);
+    if (rec) {
+      enrichLeadFromRecord(job.lead, rec);
+      job.recordRead = true;
+      const anchors = [domainOf(job.lead.website) && `domain ${domainOf(job.lead.website)}`, job.lead.record.street && 'street address', job.lead.record.companyPhone && 'HQ phone', job.lead.record.ziCompanyUrl && 'ZoomInfo profile'].filter(Boolean);
+      job.progress.push({ kind: 'note', msg: `Read the full Zoho record — anchoring on ${anchors.length ? anchors.join(', ') : 'name and location only'}.`, at: Date.now() });
+      emit('progress', { leadId: job.leadId, kind: 'note', msg: job.progress[job.progress.length - 1].msg }, user.id);
+    } else if (zohoConfigured()) {
+      job.progress.push({ kind: 'note', msg: 'Could not read the full Zoho record; profiling from the browsed row.', at: Date.now() });
+      emit('progress', { leadId: job.leadId, kind: 'note', msg: job.progress[job.progress.length - 1].msg }, user.id);
+    }
+
     let outcome;
     try { outcome = await profileLead(job, run, user, dir); }
     catch (err) { outcome = { error: `Profiling crashed: ${err.message}` }; }
@@ -2349,7 +2473,7 @@ function persistRun(run) {
       fallback: j.fallback || null, attempts: j.attempts || [],
       // The browsed row is kept so a restored run can re-render the picker
       // columns and re-run a lead without another Zoho read.
-      lead: j.lead ? { id: j.lead.id, company: j.lead.company, city: j.lead.city, state: j.lead.state,
+      lead: j.lead ? { id: j.lead.id, company: j.lead.company, city: j.lead.city, state: j.lead.state, website: j.lead.website || '',
         industry: j.lead.industry, contact: j.lead.contact, title: j.lead.title, owner: j.lead.owner || null } : null,
       cost: j.cost, costEstimated: !!j.costEstimated, toolCalls: j.toolCalls,
       durationMs: j.finishedAt && j.startedAt ? j.finishedAt - j.startedAt : null,

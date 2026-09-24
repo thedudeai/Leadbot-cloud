@@ -77,6 +77,28 @@ no longer takes the run down; stopped sessions get an estimated cost from their 
 (marked *est.*) so Stats stops under-counting them; `config.json` from an earlier version gets the
 new defaults and `model` is migrated from '' (the CLI's priciest default) to `sonnet`.
 
+## The session starts from the whole Zoho record (24 Sep 2026)
+
+A session used to be handed the nine picker columns — name, person, city, state, industry,
+website, email, phones, headcount — and nothing told it to settle *which* company it was
+researching before it started searching. Leads with an exact website on record still came back
+mixed with same-named companies elsewhere.
+
+Now, before each session, the server reads the full Zoho record (`GET /crm/v8/Leads/{id}`) and
+folds it into the lead: street address and ZIP, HQ phone, email domain, the ZoomInfo company and
+contact profile URLs, the LinkedIn and Facebook pages, the ultimate parent, the lead source, any
+provider or HR system already on record, and the existing description. The live feed says what it
+anchored on ("Read the full Zoho record — anchoring on domain x.com, street address, HQ phone").
+Both prompts then open with **STEP 0 — LOCK THE IDENTITY BEFORE ANY SEARCH**: the anchors in
+order of strength (website domain first), the rule that every ZoomInfo row, search hit or page
+must match an anchor before a fact is taken from it, domain-keyed lookups (`companyWebsite`
+rather than `companyName`, `site:domain` searches), and the instruction to stop and set
+`needsHuman` ("Could not confirm the company's identity: …") rather than profile a look-alike.
+The basic prompt's ZoomInfo calls are keyed on the domain whenever the record has one.
+
+One check runs server-side too: a returned profile whose website domain is not the record's is
+flagged `needsHuman` and `identityMismatch`, and that website is never written over the record.
+
 ## Review is a queue (23 Sep 2026)
 
 Review used to show the latest run only: starting another run replaced it, and a restart brought
