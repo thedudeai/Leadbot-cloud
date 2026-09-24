@@ -21,6 +21,11 @@ let prompt = '';
 process.stdin.on('data', (c) => (prompt += c));
 process.stdin.on('end', () => {
   const say = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  // Every prompt is kept so a test can check what the session was actually told.
+  try {
+    const id = (prompt.match(/Zoho record id: (\d+)/) || [])[1];
+    if (id && process.env.DATA_DIR) { fs.mkdirSync(path.join(process.env.DATA_DIR, 'prompts'), { recursive: true }); fs.writeFileSync(path.join(process.env.DATA_DIR, 'prompts', `${id}.${prompt.includes('BASIC PROFILE of one company') ? 'basic' : 'full'}.txt`), prompt); }
+  } catch {}
   let json;
   if (prompt.includes('one-shot capability check')) json = { skill: true, zoho: true, zohoLeadsReachable: true, zoominfo: true, websearch: true, notes: 'stub' };
   else if (prompt.includes('fetching a candidate list')) json = { error: null, leads: [{ id: '111', company: 'Stub Co', city: 'Brooklyn', state: 'NY', industry: 'Health', contact: 'A B', title: 'CEO', email: '', phone: '', mobile: '', website: '', employees: 12, created: '2026-09-01T00:00:00', profiledDate: null }] };
@@ -41,6 +46,12 @@ process.stdin.on('end', () => {
     const tick = () => { say({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebSearch', input: { query: 'again' } }] } }); setTimeout(tick, 50); };
     tick();
     return;
+  }
+  else if (prompt.includes('- Company: Drift Co')) {
+    // A session that wandered off to a look-alike: the website it returns is not the record's.
+    const id = (prompt.match(/Zoho record id: (\d+)/) || [])[1];
+    json = { leadId: id, company: 'Drift Co of Ohio', employees: 12, contactChanged: false, contact: { firstName: 'Some', lastName: 'One', title: 'CEO' }, leadership: [], entities: [], additionalContacts: [],
+      fields: { Description: 'A different company with the same name.', Website: 'https://www.drift-co-ohio.example', Employee_Count: 12 }, notes: {}, needsHuman: null, coverage: {} };
   }
   else if (prompt.includes('- Company: Hung Inc')) {
     // A session that goes silent: prints one line, then nothing, ever. The idle

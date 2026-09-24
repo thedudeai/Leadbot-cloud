@@ -12,7 +12,7 @@ const FIELDS = ['id', 'Company', 'First_Name', 'Last_Name', 'Designation', 'Emai
 const WRITE_SCOPES = 'ZohoCRM.modules.ALL ZohoCRM.settings.READ ZohoCRM.users.READ ZohoCRM.org.READ';
 
 export function startZohoStub(port) {
-  const state = { tokenOk: true, scope: WRITE_SCOPES, issued: 0, writes: [], notes: [], coql: [] };
+  const state = { tokenOk: true, scope: WRITE_SCOPES, issued: 0, writes: [], notes: [], coql: [], recordReads: [] };
   const leads = [{
     id: '111', Company: 'Stub Co', First_Name: 'A', Last_Name: 'B', Designation: 'CEO', Email: 'a@stub.test', Phone: '', Mobile: '',
     City: 'Brooklyn', State: 'NY', Industry: 'Health', Employee_Count: 12, Website: '', Lead_Status: 'New',
@@ -34,6 +34,15 @@ export function startZohoStub(port) {
       const auth = req.headers.authorization || '';
       if (!state.tokenOk || !/^Zoho-oauthtoken stub-\d+$/.test(auth)) return json(401, { code: 'INVALID_TOKEN', message: 'invalid oauth token', status: 'error' });
       if (p === '/crm/v8/org') return json(200, { org: [{ company_name: 'Stub Payroll Co', primary_email: 'boss@chs.test' }] });
+      // The full record of any lead: the identity fields the picker row never carries.
+      const one = p.match(/^\/crm\/v8\/Leads\/(\d+)$/);
+      if (one && req.method === 'GET') {
+        state.recordReads.push(one[1]);
+        return json(200, { data: [{ id: one[1], First_Name: 'Pat', Last_Name: 'Lee', Designation: 'CEO', Website: 'https://www.alpha-care.example/', Email: 'pat@alpha-care.example',
+          Phone: '(718) 555-0101', Mobile: '', Street: '1 Main St', City: 'Brooklyn', State: 'NY', Zip_Code: '11201', Company_Number: '(718) 555-0100', Industry: 'Health',
+          Employee_Count: 40, ZoomInfo_Company_Profile_URL: 'https://www.zoominfo.com/c/alpha-care/1', LinkedIn_Company_Profile_URL: 'https://www.linkedin.com/company/alpha-care',
+          Entity_Name_Ultimate_Parent: 'Alpha Holdings LLC', Lead_Source: 'ZoomInfo', Description: 'Home care agency in Brooklyn.', Owner: { id: '999', name: 'Rep One' } }] });
+      }
       if (p === '/crm/v8/settings/modules/Leads') return json(200, { modules: [{ api_name: 'Leads', editable: true }] });
       if (p === '/crm/v8/settings/fields') return json(200, { fields: FIELDS.map((n) => ({ api_name: n, data_type: 'text' })) });
       if (p === '/crm/v8/users') return json(200, { users: [
