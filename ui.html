@@ -999,8 +999,15 @@ function writeResultHtml(w) {
   const lines = [];
   lines.push(fields.length ? '<b>' + fields.length + ' field' + (fields.length === 1 ? '' : 's') + '</b> — ' +
     fields.map((f) => '<code>' + esc(f) + '</code>').join(' ') : 'No fields written.');
-  lines.push(notes.length ? '<b>' + notes.length + ' note' + (notes.length === 1 ? '' : 's') + '</b> — ' +
-    notes.map(esc).join(', ') : 'No notes written.');
+  // A re-profile replaces its earlier sections in place, so a write can be all
+  // "unchanged" and still be exactly right.
+  const upd = w.notesUpdated || [], same = w.notesUnchanged || [];
+  const noteBits = [];
+  if (notes.length) noteBits.push('<b>' + notes.length + ' new</b> — ' + notes.map(esc).join(', '));
+  if (upd.length) noteBits.push('<b>' + upd.length + ' updated in place</b> — ' + upd.map(esc).join(', '));
+  if (same.length) noteBits.push(same.length + ' unchanged — ' + same.map(esc).join(', '));
+  if (w.notesRemoved) noteBits.push(w.notesRemoved + ' duplicate' + (w.notesRemoved === 1 ? '' : 's') + ' from earlier profiles removed');
+  lines.push(noteBits.length ? 'Notes: ' + noteBits.join(' · ') : 'No notes written.');
 
   const warnings = w.warnings || [];
   if (warnings.length) lines.push(warnings.map((x) =>

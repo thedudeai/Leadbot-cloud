@@ -12,7 +12,7 @@ const FIELDS = ['id', 'Company', 'First_Name', 'Last_Name', 'Designation', 'Emai
 const WRITE_SCOPES = 'ZohoCRM.modules.ALL ZohoCRM.settings.READ ZohoCRM.users.READ ZohoCRM.org.READ';
 
 export function startZohoStub(port) {
-  const state = { tokenOk: true, scope: WRITE_SCOPES, issued: 0, writes: [], notes: [], coql: [], recordReads: [] };
+  const state = { tokenOk: true, scope: WRITE_SCOPES, issued: 0, writes: [], notes: [], noteSeq: 0, noteUpdates: [], noteDeletes: [], coql: [], recordReads: [] };
   const leads = [{
     id: '111', Company: 'Stub Co', First_Name: 'A', Last_Name: 'B', Designation: 'CEO', Email: 'a@stub.test', Phone: '', Mobile: '',
     City: 'Brooklyn', State: 'NY', Industry: 'Health', Employee_Count: 12, Website: '', Lead_Status: 'New',
@@ -45,6 +45,7 @@ export function startZohoStub(port) {
       }
       if (p === '/crm/v8/settings/modules/Leads') return json(200, { modules: [{ api_name: 'Leads', editable: true }] });
       if (p === '/crm/v8/settings/fields') return json(200, { fields: FIELDS.map((n) => ({ api_name: n, data_type: 'text' })) });
+      if (p === '/crm/v8/users' && url.searchParams.get('type') === 'CurrentUser') return json(200, { users: [{ id: '1', full_name: 'Boss', email: 'boss@zoho.test' }] });
       if (p === '/crm/v8/users') return json(200, { users: [
         { id: '1', full_name: 'Boss', email: 'boss@zoho.test', status: 'active' },
         { id: '999', full_name: 'Rep One', email: 'rep.one@zoho.test', status: 'active' }], info: { more_records: false } });
@@ -59,10 +60,27 @@ export function startZohoStub(port) {
         state.writes.push(d);
         return json(200, { data: [{ code: 'SUCCESS', status: 'success', message: 'record updated', details: { id: d.id } }] });
       }
+      // Notes: list, add, update in place, delete. Every note carries who wrote it, so
+      // the server can tell its own sections from a rep's.
       const m = p.match(/^\/crm\/v8\/Leads\/(\d+)\/Notes$/);
+      if (m && req.method === 'GET') {
+        const mine = state.notes.filter((n) => n.leadId === m[1]);
+        if (!mine.length) { res.writeHead(204); return res.end(); }
+        return json(200, { data: mine.map((n) => ({ id: n.id, Note_Title: n.Note_Title, Note_Content: n.Note_Content, Created_Time: n.Created_Time, Modified_Time: n.Modified_Time, Created_By: n.Created_By })), info: { more_records: false } });
+      }
       if (m && req.method === 'POST') {
-        state.notes.push({ leadId: m[1], ...JSON.parse(body).data[0] });
-        return json(200, { data: [{ code: 'SUCCESS', status: 'success', details: { id: `n${state.notes.length}` } }] });
+        const d = JSON.parse(body).data[0];
+        const id = `n${++state.noteSeq}`, now = new Date().toISOString();
+        state.notes.push({ leadId: m[1], id, Note_Title: d.Note_Title, Note_Content: d.Note_Content, Created_Time: now, Modified_Time: now, Created_By: { id: '1', name: 'Boss' } });
+        return json(200, { data: [{ code: 'SUCCESS', status: 'success', details: { id } }] });
+      }
+      const one2 = p.match(/^\/crm\/v8\/Leads\/(\d+)\/Notes\/(\w+)$/);
+      if (one2 && (req.method === 'PUT' || req.method === 'DELETE')) {
+        const n = state.notes.find((x) => x.leadId === one2[1] && x.id === one2[2]);
+        if (!n) return json(404, { data: [{ code: 'INVALID_DATA', status: 'error', message: 'no such note' }] });
+        if (req.method === 'DELETE') { state.notes = state.notes.filter((x) => x !== n); state.noteDeletes.push(n.id); }
+        else { const d = JSON.parse(body).data[0]; Object.assign(n, { Note_Title: d.Note_Title, Note_Content: d.Note_Content, Modified_Time: new Date().toISOString() }); state.noteUpdates.push(n.id); }
+        return json(200, { data: [{ code: 'SUCCESS', status: 'success', details: { id: n.id } }] });
       }
       json(404, { code: 'INVALID_URL_PATTERN', message: `the stub has no route for ${req.method} ${p}` });
     });

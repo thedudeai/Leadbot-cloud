@@ -1014,6 +1014,74 @@ async function writeNote(leadId, title, content) {
   return rowOutcome(res);
 }
 
+// --- the notes already on the record -------------------------------------------
+// A re-profile used to post a fresh copy of every section, so a record written
+// three times carried three PAYROLL FINDINGS and three ICEBREAKERS. Now the notes
+// on the record are read first: a section the bot wrote before is updated in
+// place, left alone when nothing changed, and its older duplicates are removed.
+// Notes a person wrote are never touched.
+const BOT_NOTE_TITLES = new Set([...NOTE_ORDER, 'BASIC PROFILE']);
+const normTitle = (t) => cleanStr(t).toUpperCase().replace(/\s+/g, ' ');
+const normNote = (t) => cleanStr(t).replace(/\r\n?/g, '\n').replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+
+async function zohoLeadNotes(leadId) {
+  const out = [];
+  try {
+    for (let page = 1; page <= 3; page++) {
+      const r = await zohoApi(`/crm/v8/Leads/${encodeURIComponent(String(leadId))}/Notes?fields=id,Note_Title,Note_Content,Created_Time,Modified_Time,Created_By&per_page=200&page=${page}`);
+      if (r.status === 204 || r.status >= 400 || !r.json || !Array.isArray(r.json.data)) break;
+      for (const n of r.json.data) {
+        out.push({ id: String(n.id), title: cleanStr(n.Note_Title), content: typeof n.Note_Content === 'string' ? n.Note_Content : '',
+          createdAt: n.Created_Time || '', modifiedAt: n.Modified_Time || n.Created_Time || '',
+          createdBy: n.Created_By && typeof n.Created_By === 'object' ? { id: String(n.Created_By.id || ''), name: cleanStr(n.Created_By.name) } : null });
+      }
+      if (!(r.json.info && r.json.info.more_records)) break;
+    }
+  } catch {}
+  return out.sort((a, b) => String(b.modifiedAt).localeCompare(String(a.modifiedAt)));
+}
+
+// The API user is whoever generated the refresh token; every note this bot ever
+// wrote is created by them. Cached: it does not change while the token lives.
+let botUserCache = { at: 0, id: null, token: null };
+async function zohoBotUserId() {
+  if (botUserCache.id && botUserCache.token === tokenCache.token && Date.now() - botUserCache.at < 6 * 3600_000) return botUserCache.id;
+  try {
+    const r = await zohoApi('/crm/v8/users?type=CurrentUser');
+    const u = r.json && Array.isArray(r.json.users) ? r.json.users[0] : null;
+    botUserCache = { at: Date.now(), id: u && u.id ? String(u.id) : null, token: tokenCache.token };
+  } catch { botUserCache = { at: Date.now(), id: null, token: tokenCache.token }; }
+  return botUserCache.id;
+}
+
+/**
+ * Write one section to the record without duplicating it.
+ * Returns { ok, action: 'created' | 'updated' | 'unchanged', removed, error }.
+ */
+async function upsertNote(leadId, title, content, existing, botUserId) {
+  const isBot = (n) => botUserId ? !!(n.createdBy && n.createdBy.id === botUserId) : BOT_NOTE_TITLES.has(normTitle(n.title));
+  const mine = existing.filter((n) => normTitle(n.title) === normTitle(title) && isBot(n));   // newest first
+  let removed = 0;
+  const dropOlder = async () => {
+    for (const n of mine.slice(1)) {
+      const r = await zohoApi(`/crm/v8/Leads/${encodeURIComponent(leadId)}/Notes/${encodeURIComponent(n.id)}`, { method: 'DELETE' });
+      if (rowOutcome(r).ok) removed++;
+    }
+  };
+  if (!mine.length) {
+    const o = await writeNote(leadId, title, content);
+    return { ...o, action: 'created', removed };
+  }
+  const newest = mine[0];
+  if (normNote(newest.content) === normNote(content)) { await dropOlder(); return { ok: true, id: newest.id, action: 'unchanged', removed }; }
+  const res = await zohoApi(`/crm/v8/Leads/${encodeURIComponent(leadId)}/Notes/${encodeURIComponent(newest.id)}`, {
+    method: 'PUT', body: { data: [{ Note_Title: String(title), Note_Content: String(content) }] },
+  });
+  const o = rowOutcome(res);
+  if (o.ok) await dropOlder();
+  return { ...o, action: 'updated', removed };
+}
+
 /**
  * Write one approved profile straight to the CRM.
  * Returns { ok, partial, leadId, fieldsWritten, notesWritten, newLeadId, skipped, error }.
@@ -1024,7 +1092,7 @@ async function writeNote(leadId, title, content) {
 async function writeLeadDirect(result, mode = 'full') {
   const basic = mode === 'basic';
   const leadId = String(result.leadId || '');
-  const out = { ok: false, partial: false, leadId, fieldsWritten: [], notesWritten: [], newLeadId: null, skipped: [], warnings: [], error: null };
+  const out = { ok: false, partial: false, leadId, fieldsWritten: [], notesWritten: [], notesUpdated: [], notesUnchanged: [], notesRemoved: 0, newLeadId: null, skipped: [], warnings: [], error: null };
   if (!leadId) { out.error = 'This result has no Zoho record id.'; return out; }
 
   const c = result.contact || {};
@@ -1191,6 +1259,11 @@ async function writeLeadDirect(result, mode = 'full') {
       + lines.join('\n') + totalLine;   // boldHeadlines runs on it in the write loop below
   }
 
+  // What is on the record now, so each section replaces its predecessor instead
+  // of joining it. Read once per write, right before the notes go out.
+  const existing = await zohoLeadNotes(leadId);
+  const botUserId = await zohoBotUserId();
+
   for (const title of orderedNotes(notes)) {
     const bodyText = notes[title];
     if (!filled(bodyText)) continue;
@@ -1203,9 +1276,12 @@ async function writeLeadDirect(result, mode = 'full') {
     const loose = looseDates(clean);
     if (loose) out.warnings.push(`${loose} line${loose === 1 ? '' : 's'} in the ${title} note carry a date mid-sentence. Dates belong at the end of the line in square brackets.`);
     // Bold last — the filters above match ordinary letters and would miss on bold ones.
-    const o = await writeNote(leadId, title, boldHeadlines(clean));
-    if (o.ok) out.notesWritten.push(title);
-    else failures.push(`Note ${title} failed: ${o.error}`);
+    const o = await upsertNote(leadId, title, boldHeadlines(clean), existing, botUserId);
+    out.notesRemoved += o.removed || 0;
+    if (!o.ok) failures.push(`Note ${title} failed: ${o.error}`);
+    else if (o.action === 'updated') out.notesUpdated.push(title);
+    else if (o.action === 'unchanged') out.notesUnchanged.push(title);
+    else out.notesWritten.push(title);
   }
 
   if (!basic && !Object.keys(notes).some((k) => k.toUpperCase().includes('FINDING'))) {
@@ -1214,7 +1290,7 @@ async function writeLeadDirect(result, mode = 'full') {
 
   if (failures.length) {
     out.error = failures.join(' · ');
-    const landed = out.fieldsWritten.length || out.notesWritten.length || out.newLeadId;
+    const landed = out.fieldsWritten.length || out.notesWritten.length || out.notesUpdated.length || out.newLeadId;
     out.partial = !!landed;
   } else {
     out.ok = true;
@@ -1916,6 +1992,30 @@ function leadBlock(lead) {
     + (lead.record ? '' : '\n- (The full Zoho record could not be read for this run; the lines above are the browsed row.)');
 }
 
+// What the last profile left on the record, so a re-run improves it instead of
+// starting over and saying everything twice. Bot sections first, then whatever
+// the team wrote, both trimmed so the prompt stays affordable.
+function previousProfileBlock(lead) {
+  const prev = lead.previous;
+  if (!prev || !Array.isArray(prev.notes) || !prev.notes.length) return '';
+  const when = (n) => { const d = new Date(n.modifiedAt || n.createdAt); return Number.isNaN(d.getTime()) ? '' : ` (${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()})`; };
+  const cut = (s, n) => (s.length > n ? s.slice(0, n) + ' …[trimmed]' : s);
+  let budget = 14_000;
+  const take = (n, max) => { const body = cut(normNote(n.content), Math.min(max, budget)); budget -= body.length; return body; };
+  // The bot's own sections are told apart by author when the API user is known,
+  // so a note a rep filed under the same title reads as the team's, not as the
+  // profile to build on.
+  const isBot = (n) => BOT_NOTE_TITLES.has(normTitle(n.title)) && (prev.botUserId ? !!(n.createdBy && n.createdBy.id === prev.botUserId) : true);
+  const seen = new Set();
+  const bot = prev.notes.filter(isBot).filter((n) => !seen.has(normTitle(n.title)) && seen.add(normTitle(n.title)));
+  const other = prev.notes.filter((n) => !isBot(n)).slice(0, 6);
+  const stamp = prev.profileType || prev.profiledDate ? ` — last profiled${prev.profileType ? ` as ${prev.profileType}` : ''}${prev.profiledDate ? ` on ${prev.profiledDate}` : ''}` : '';
+  return `PREVIOUS PROFILE${stamp}. These sections are on the record now. START FROM THEM, do not start over: check what is there (is the person still there, is the provider still the same, are the numbers current), add what is new, correct what changed, drop what is no longer true. Return every section IN FULL as it should read today — the dashboard replaces the record's note of the same title in place, so a section with nothing new must come back exactly as it stands below and a changed section must be the whole improved text, never an addendum. Never say the same thing in two sections, never write a second set of icebreakers or a second roster: improve the one that exists. Spend your calls on what is missing or stale, not on re-establishing what is already here.
+${bot.map((n) => `--- ${normTitle(n.title)}${when(n)} ---\n${take(n, 3500)}`).join('\n')}${other.length ? `\n--- OTHER NOTES ON THE RECORD (written by the team; context only, never rewrite these) ---\n${other.map((n) => `${n.title || 'Note'}${when(n)}: ${take(n, 600)}`).join('\n')}` : ''}
+
+`;
+}
+
 // The rule that keeps a session on THIS company. Written once, sent with both
 // prompts, and phrased around the anchors the record actually has.
 function identityLock(lead) {
@@ -1975,7 +2075,7 @@ ${leadBlock(lead)}
 
 ${identityLock(lead)}
 
-THE JOB: verify the contact and settle who the top decision-maker is; build the leadership roster with phone numbers; research the company through the four rounds; write the Description, the notes and the icebreakers. No scoring of any kind — no fit score, tier, temperature, confidence rating or deal value. Report facts, sources and dates and let the rep judge.
+${previousProfileBlock(lead)}THE JOB: verify the contact and settle who the top decision-maker is; build the leadership roster with phone numbers; research the company through the four rounds; write the Description, the notes and the icebreakers. No scoring of any kind — no fit score, tier, temperature, confidence rating or deal value. Report facts, sources and dates and let the rep judge.
 
 WORK EFFICIENTLY — these rules cut cost, never depth:
 - Start with ONE ToolSearch call that loads every tool you will need at once: "select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_contacts,mcp__claude_ai_ZoomInfo__search_contacts,mcp__claude_ai_ZoomInfo__enrich_companies,mcp__claude_ai_ZoomInfo__search_scoops,mcp__claude_ai_Zoho_CRM__searchRecords". If that select comes back with any ZoomInfo tool missing, make ONE keyword ToolSearch for "zoominfo" and use the names it returns; the ZoomInfo steps are not optional. Never load tools one at a time. Do not read any file, run any command or list any directory — everything you need is in this message.
@@ -2049,7 +2149,7 @@ ${leadBlock(lead)}
 
 ${identityLock(lead)}
 
-THE SIX FACTS AND THE ONE WAY TO GET EACH:
+${previousProfileBlock(lead)}THE SIX FACTS AND THE ONE WAY TO GET EACH:
 1. WHAT THEY ARE — nursing home, home care agency, manufacturer, charter school, etc. Method: the company website home page (WebFetch ${lead.website || 'the site established in step 0'}); this fetch is also the identity check in step 0. No website on record: the ONE WebSearch from step 0, "${lead.company}" ${[lead.city, lead.state].filter(Boolean).join(' ')}, and use the result whose address or phone matches the record — not merely the first hit with that name.
 2. OWNERSHIP AND THE LEADERSHIP ROSTER — who owns it (a single owner, partners, a family, a private-equity group, a public company, a nonprofit board) and every owner and C-level person you can name: CEO, President, CFO, COO, other chiefs. Method: ONE ZoomInfo contact search on the company — mcp__claude_ai_ZoomInfo__search_contacts with ${domainOf(lead.website) ? `companyWebsite "${domainOf(lead.website)}" (the domain pins the company; add companyName "${lead.company}" only as a second field)` : `companyName "${lead.company}" — and check the rows' company location against ${[lead.city, lead.state].filter(Boolean).join(', ') || 'the record'} before using them`}, managementLevelList ["C Level Exec", "VP Level Exec"], sort "-contactAccuracyScore", pageSize 10. "Owner" is NOT a valid management level; owners, founders, partners and principals usually carry a C-level title in ZoomInfo and this search returns them. Do not pass jobTitleList together with managementLevelList. Keep the personId of every row — fact 6 needs them. If the website has an about or leadership page and you already fetched the site, read the names off that too, but do not go looking for more.
 3. EMPLOYEE COUNT — Method: ONE ZoomInfo company enrichment — mcp__claude_ai_ZoomInfo__enrich_companies with companies [{ ${domainOf(lead.website) ? `companyWebsite "${domainOf(lead.website)}", companyName "${lead.company}"` : `companyName "${lead.company}"`} }] and requiredFields ["name","website","employeeCount","employeeRange","street","city","state","zipCode","phone","locationCount","ultimateParentName","parentName","type","description","socialMediaUrls"]. Without requiredFields the tool returns no headcount and no address, so always pass that list. Two special cases:
@@ -2402,6 +2502,15 @@ async function startRun(user, leads, pepm, mode = 'full') {
     if (rec) {
       enrichLeadFromRecord(job.lead, rec);
       job.recordRead = true;
+      // And what the last profile left behind, so this one builds on it.
+      const notes = await zohoLeadNotes(job.leadId);
+      if (notes.length) {
+        const botUserId = await zohoBotUserId();
+        job.lead.previous = { notes, botUserId, profiledDate: job.lead.record.profiledDate || null, profileType: job.lead.record.profileType || null };
+        const sections = notes.filter((n) => BOT_NOTE_TITLES.has(normTitle(n.title)) && (botUserId ? !!(n.createdBy && n.createdBy.id === botUserId) : true)).length;
+        job.progress.push({ kind: 'note', msg: `Found ${notes.length} note${notes.length === 1 ? '' : 's'} on the record${sections ? ` (${sections} from earlier profiles)` : ''} — this run builds on them instead of starting over.`, at: Date.now() });
+        emit('progress', { leadId: job.leadId, kind: 'note', msg: job.progress[job.progress.length - 1].msg }, user.id);
+      }
       const anchors = [domainOf(job.lead.website) && `domain ${domainOf(job.lead.website)}`, job.lead.record.street && 'street address', job.lead.record.companyPhone && 'HQ phone', job.lead.record.ziCompanyUrl && 'ZoomInfo profile'].filter(Boolean);
       job.progress.push({ kind: 'note', msg: `Read the full Zoho record — anchoring on ${anchors.length ? anchors.join(', ') : 'name and location only'}.`, at: Date.now() });
       emit('progress', { leadId: job.leadId, kind: 'note', msg: job.progress[job.progress.length - 1].msg }, user.id);
@@ -2498,6 +2607,16 @@ function persistRun(run) {
   };
   if (idx >= 0) history.runs[idx] = record; else history.runs.push(record);
   writeJSON(HISTORY_PATH, history);
+}
+
+// One line for the live feed: what a write did to the record's notes.
+function writeSummary(w) {
+  const parts = [];
+  if (w.notesWritten.length) parts.push(`${w.notesWritten.length} new`);
+  if ((w.notesUpdated || []).length) parts.push(`${w.notesUpdated.length} updated`);
+  if ((w.notesUnchanged || []).length) parts.push(`${w.notesUnchanged.length} unchanged`);
+  if (w.notesRemoved) parts.push(`${w.notesRemoved} duplicate${w.notesRemoved === 1 ? '' : 's'} removed`);
+  return `Wrote ${w.fieldsWritten.length} field${w.fieldsWritten.length === 1 ? '' : 's'}; notes: ${parts.length ? parts.join(', ') : 'none'}.`;
 }
 
 const publicJob = (j) => ({
@@ -3103,9 +3222,7 @@ const server = http.createServer(async (req, res) => {
           }
           emit('progress', {
             leadId: job.leadId, kind: 'note',
-            msg: job.writeResult.ok
-              ? `Wrote ${job.writeResult.fieldsWritten.length} fields and ${job.writeResult.notesWritten.length} notes.`
-              : job.writeResult.error || 'Write failed.',
+            msg: job.writeResult.ok ? writeSummary(job.writeResult) : job.writeResult.error || 'Write failed.',
           }, user.id);
         } else {
           const r = await runClaude(writePrompt(job.result, run.pepm, job.mode || run.mode || 'full'), {

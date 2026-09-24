@@ -69,6 +69,13 @@ r = await call('rep', '/api/state'); assert.equal(r.json.scope.lockOwner, '999')
 r = await call('rep', '/api/run', { leads: [{ id: '5', company: 'X', owner: { id: '123' } }] }); assert.equal(r.status, 403); ok('rep cannot profile a lead owned by someone else');
 
 // 5. Run + write for the rep (stub CLI, stub Zoho; the write goes straight to the stub CRM)
+// The record already carries an earlier profile's sections — twice, from two old writes —
+// plus a note a rep wrote under the same title and one of their own.
+const old = (id, title, content, by, when) => zohoStub.state.notes.push({ leadId: '5001', id, Note_Title: title, Note_Content: content, Created_Time: when, Modified_Time: when, Created_By: by });
+old('old1', 'PAYROLL FINDINGS', 'STAFF — a stale finding from June. (site) [6/1/2026]', { id: '1', name: 'Boss' }, '2026-06-01T10:00:00-04:00');
+old('old2', 'PAYROLL FINDINGS', 'STAFF — an even older copy. (site) [5/1/2026]', { id: '1', name: 'Boss' }, '2026-05-01T10:00:00-04:00');
+old('rep1', 'PAYROLL FINDINGS', 'Rep wrote this by hand.', { id: '999', name: 'Rep One' }, '2026-07-01T10:00:00-04:00');
+old('rep2', 'Call notes', 'Spoke to the owner, call back in October.', { id: '999', name: 'Rep One' }, '2026-08-01T10:00:00-04:00');
 r = await call('rep', '/api/run', { leads: [{ id: '5001', company: 'Alpha Care', owner: { id: '999' } }, { id: '5002', company: 'Beta School', owner: { id: '999' } }] });
 assert.equal(r.status, 200); const runId = r.json.runId; ok('rep starts a 2-lead run ' + runId);
 r = await call('rep', '/api/run', { leads: [{ id: '5003', company: 'C', owner: { id: '999' } }] }); assert.equal(r.status, 409); ok('second concurrent run refused');
@@ -89,6 +96,9 @@ assert.equal(s.run.jobs[0].result.contact.firstName, 'Pat'); assert.equal(s.run.
   assert.match(prompt, /STEP 0 — LOCK THE IDENTITY BEFORE ANY SEARCH/); assert.match(prompt, /the website domain alpha-care.example — the strongest anchor/); assert.match(prompt, /Street address: 1 Main St, Brooklyn, NY 11201/);
   assert.match(prompt, /Company phone \(HQ\): \(718\) 555-0100/); assert.match(prompt, /area code 718/); assert.match(prompt, /ZoomInfo company profile: https:\/\/www.zoominfo.com\/c\/alpha-care\/1/); assert.match(prompt, /Ultimate parent on record: Alpha Holdings LLC/);
   assert.match(prompt, /companyWebsite "alpha-care.example"/); assert.match(prompt, /site:alpha-care.example/); ok('the prompt carries every anchor and the identity-lock step, keyed on the domain');
+  assert.match(prompt, /PREVIOUS PROFILE[\s\S]*--- PAYROLL FINDINGS \(6\/1\/2026\) ---\nSTAFF — a stale finding from June/); assert.ok(!prompt.includes('an even older copy'));
+  assert.match(prompt, /OTHER NOTES ON THE RECORD[\s\S]*Call notes \(8\/1\/2026\): Spoke to the owner[^\n]*\nPAYROLL FINDINGS \(7\/1\/2026\): Rep wrote this by hand\./); assert.match(prompt, /START FROM THEM, do not start over/);
+  assert.ok(s.run.jobs[0].progress.some((p) => /Found 4 notes on the record \(2 from earlier profiles\)/.test(p.msg))); ok('the prompt carries the previous profile once per section, with the team\'s notes as context');
 }
 assert.ok(fs.existsSync(path.join(STORE, 'runs', runId, '5001.json'))); ok('result JSON persisted on the volume');
 r = await call('admin', '/api/state'); assert.equal(r.json.run, null); ok("admin's own run state is untouched by the rep's run");
@@ -97,8 +107,29 @@ s = await pollRun('rep', (x) => x.run.jobs.find((j) => j.leadId === '5001').writ
 assert.equal(s.run.jobs.find((j) => j.leadId === '5002').written, false); ok('only the approved lead was written');
 assert.equal(zohoStub.state.writes.length, 1); assert.equal(zohoStub.state.writes[0].id, '5001'); assert.equal(zohoStub.state.writes[0].First_Name, 'Pat');
 assert.ok(zohoStub.state.notes.some((n) => n.leadId === '5001' && n.Note_Title === 'PAYROLL FINDINGS')); ok('…and it landed in the CRM as a field update plus notes');
+{
+  const w = s.run.jobs.find((j) => j.leadId === '5001').writeResult;
+  assert.deepEqual(w.notesUpdated, ['PAYROLL FINDINGS']); assert.deepEqual(w.notesWritten, ['LEADERSHIP CONTACTS']);   // COMPLIANCE says 'no violations found' and the absence filter drops it assert.equal(w.notesRemoved, 1); assert.deepEqual(w.notesUnchanged, []);
+  const pf = zohoStub.state.notes.filter((n) => n.leadId === '5001' && n.Note_Title === 'PAYROLL FINDINGS');
+  assert.equal(pf.length, 2); assert.ok(pf.find((n) => n.id === 'old1' && /forty people/.test(n.Note_Content))); assert.ok(pf.find((n) => n.id === 'rep1' && n.Note_Content === 'Rep wrote this by hand.'));
+  assert.ok(!zohoStub.state.notes.some((n) => n.id === 'old2')); assert.deepEqual(zohoStub.state.noteDeletes, ['old2']); assert.deepEqual(zohoStub.state.noteUpdates, ['old1']);
+  ok('the earlier PAYROLL FINDINGS was updated in place, its older duplicate removed, the rep\'s note untouched');
+}
 const reviewIds = (st) => st.review.map((j) => j.leadId).sort();
 assert.deepEqual(reviewIds(s), ['5001', '5002']); assert.equal(s.review.find((j) => j.leadId === '5001').written, true); ok('review queue: the written lead still shows its tick, the other waits');
+// Profiling the same lead again writes nothing twice: every section comes back unchanged.
+r = await call('rep', '/api/run', { force: true, leads: [{ id: '5001', company: 'Alpha Care', owner: { id: '999' } }] }); assert.equal(r.status, 200); const rerun = r.json.runId;
+s = await pollRun('rep', (x) => x.run && x.run.id === rerun && x.run.finishedAt && x.run.jobs[0].status === 'done', 100);
+assert.match(fs.readFileSync(path.join(STORE, 'prompts', '5001.full.txt'), 'utf8'), /PREVIOUS PROFILE[\s\S]*--- PAYROLL FINDINGS[^\n]*---\n[^\n]*forty people on payroll/); ok('the re-run is handed the sections the first write left on the record');
+r = await call('rep', '/api/write', { leadIds: ['5001'] }); assert.equal(r.json.queued, 1);
+s = await pollRun('rep', (x) => x.run.jobs[0].written);
+{
+  const w = s.run.jobs[0].writeResult, before = zohoStub.state.notes.filter((n) => n.leadId === '5001').length;
+  assert.deepEqual(w.notesUnchanged, ['PAYROLL FINDINGS', 'LEADERSHIP CONTACTS']); assert.deepEqual(w.notesWritten, []); assert.deepEqual(w.notesUpdated, []); assert.equal(w.notesRemoved, 0);
+  assert.equal(zohoStub.state.notes.filter((n) => n.leadId === '5001').length, before); assert.equal(zohoStub.state.noteUpdates.length, 1);
+  ok('re-writing the same profile changes no note and adds none');
+}
+
 // A session that drifts to a look-alike company is caught by the server: its website is not the record's.
 r = await call('rep', '/api/run', { leads: [{ id: '5101', company: 'Drift Co', owner: { id: '999' } }] }); assert.equal(r.status, 200); const driftRun = r.json.runId;
 s = await pollRun('rep', (x) => x.run && x.run.id === driftRun && x.run.finishedAt, 100);
@@ -160,8 +191,8 @@ assert.equal(r.status, 400); assert.match(r.json.error, /Basic profile/); ok('51
 
 // 6. Stats
 r = await call('rep', '/api/stats?scope=all'); assert.equal(r.status, 403); ok('rep cannot see everyone stats');
-r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 32); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 3);
-assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 6); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
+r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 33); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 4);
+assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 7); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
 r = await call('admin', '/api/stats'); assert.equal(r.json.totalLeads, 0); ok("admin's own stats are separate");
 
 // 6a. The readiness gate: nothing runs while Zoho cannot take the write-back or

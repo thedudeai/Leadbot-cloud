@@ -77,6 +77,27 @@ no longer takes the run down; stopped sessions get an estimated cost from their 
 (marked *est.*) so Stats stops under-counting them; `config.json` from an earlier version gets the
 new defaults and `model` is migrated from '' (the CLI's priciest default) to `sonnet`.
 
+## A re-profile improves the record instead of repeating it (24 Sep 2026)
+
+Every write used to post a fresh copy of every section, so a lead profiled three times carried
+three PAYROLL FINDINGS, three ICEBREAKERS and three leadership rosters. Two things changed.
+
+**The write updates in place.** Before the notes go out, the server reads the notes already on
+the record and who wrote them (the API user — whoever generated the refresh token — is the bot).
+For each section it is about to write: a bot note of the same title that says the same thing is
+left alone (`unchanged`); one that differs is **updated in place** (`updated`); when there is
+none, the note is created. Older bot duplicates of the same title are removed. Notes a person
+wrote are never touched, even under the same title. The write result (Review → open a row) and
+the live feed report `new / updated in place / unchanged / duplicates removed`.
+
+**The session starts from the previous profile.** When the record has bot sections on it, the
+prompt carries them under **PREVIOUS PROFILE** (once per title, newest copy, trimmed), plus the
+team's own notes as read-only context, with the instruction to start from them — verify, add,
+correct, drop what is no longer true — and return every section in full as it should read
+today, word for word where nothing changed, never as an addendum and never as a second set of
+icebreakers or a second roster. The live feed says how many notes were found and how many came
+from earlier profiles.
+
 ## The session starts from the whole Zoho record (24 Sep 2026)
 
 A session used to be handed the nine picker columns — name, person, city, state, industry,
