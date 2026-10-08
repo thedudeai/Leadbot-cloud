@@ -640,8 +640,17 @@ function renderPicker() {
           '</select>' +
         '</div>' : '') +
     '</div>' +
+    '<div id="deep-panel" class="card" style="display:none;margin-top:14px">' +
+      '<div style="font-size:11px;letter-spacing:.06em;color:var(--dim2);margin-bottom:8px">DEEP DIVE — ONE QUESTION, THE WHOLE RESEARCH BUDGET</div>' +
+      '<p class="muted tiny" style="margin:0 0 10px">For when you need one specific thing on a lead and a full profile would spend its calls on everything else. Pick a question or write your own. It starts from the record and the profile already on it, goes down every ladder for that subject, and lands in Review like any other result — only what it finds gets written. Up to 10 leads.</p>' +
+      '<div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:10px">' +
+        DEEP_PRESETS.map((q, i) => '<button class="btn sm deep-pick" data-i="' + i + '">' + esc(q.label) + '</button>').join('') + '</div>' +
+      '<textarea id="deep-q" rows="2" maxlength="400" placeholder="What exactly should it find out? e.g. The owner\'s mobile number, or: every legal entity this group runs payroll under, with headcount for each." style="width:100%;box-sizing:border-box;background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:8px 10px;border-radius:8px;font:inherit;resize:vertical"></textarea>' +
+      '<div class="row" style="margin-top:10px"><button class="btn primary" id="deep-go" disabled>Deep dive 0 leads</button><span class="muted tiny" id="deep-note">Same caps as a full profile: $' + (S.config.maxCostFull != null ? S.config.maxCostFull : 6) + ' and ' + (S.config.perLeadTimeoutMin || 25) + ' minutes per lead.</span></div>' +
+    '</div>' +
     '<div class="bar-sticky"><button class="btn primary" id="start" disabled>Profile 0 leads</button>' +
     '<button class="btn" id="start-basic" disabled title="Six facts per lead, one lookup each: what they are, ownership and CEO, headcount, HR/applicant system, HQ, owner contact info. About a tenth of the cost of a full profile.">Basic profile 0 leads</button>' +
+    '<button class="btn" id="start-deep" disabled title="One specific question, answered with the whole research budget — the owner\'s mobile, who really owns it, every legal entity.">Deep dive…</button>' +
     '<span class="muted tiny" id="est"></span></div>';
 
   const sync = () => {
@@ -653,6 +662,11 @@ function renderPicker() {
     b.disabled = !c || blocked; b.textContent = 'Profile ' + c + ' lead' + (c === 1 ? '' : 's');
     bb.disabled = !c || blocked; bb.textContent = 'Basic profile ' + c + ' lead' + (c === 1 ? '' : 's');
     b.title = blocked ? 'Profiling is paused — see the notice at the top of this screen.' : '';
+    const bd = $('#start-deep'), go = $('#deep-go');
+    bd.disabled = !c || blocked;
+    go.disabled = !c || blocked || c > 10 || !$('#deep-q').value.trim();
+    go.textContent = 'Deep dive ' + c + ' lead' + (c === 1 ? '' : 's');
+    if (c > 10) $('#deep-note').textContent = 'Ten leads at most for a deep dive — it spends a full research budget on each.';
     const conc = S.config.concurrency || 3, bconc = S.config.basicConcurrency || 20;
     $('#est').textContent = c
       ? 'Full: ~' + Math.ceil(c / conc) * 8 + '–' + Math.ceil(c / conc) * 15 + ' min at ' + conc + ' at a time \u00b7 Basic: ~' + Math.ceil(c / bconc) * 2 + '–' + Math.ceil(c / bconc) * 5 + ' min at ' + bconc + ' at a time'
@@ -691,9 +705,10 @@ function renderPicker() {
   if ($('#next')) $('#next').onclick = () => { if (pageInfo.hasMore) { browse.page++; browseFetch(); } };
   if ($('#per')) $('#per').onchange = () => { browse.per = Number($('#per').value) || 50; browse.page = 1; browseFetch(); };
   const kick = async (mode, force) => {
-    $('#start').disabled = true; $('#start-basic').disabled = true;
-    $(mode === 'basic' ? '#start-basic' : '#start').textContent = 'Checking connections…';
-    const r = await api('/api/run', { leads: Array.from(picked.values()), pepm: Number($('#pepm').value) || S.config.pepm, mode, force: !!force });
+    $('#start').disabled = true; $('#start-basic').disabled = true; $('#start-deep').disabled = true; $('#deep-go').disabled = true;
+    $(mode === 'basic' ? '#start-basic' : mode === 'deep' ? '#deep-go' : '#start').textContent = 'Checking connections…';
+    const r = await api('/api/run', { leads: Array.from(picked.values()), pepm: Number($('#pepm').value) || S.config.pepm, mode, force: !!force,
+      question: mode === 'deep' ? $('#deep-q').value.trim() : undefined });
     if (r.error === 'blocked' && r.readiness) {
       // The server refused to start: a connection is down. Show the notice and stop.
       S.readiness = r.readiness; renderReady(); sync();
@@ -710,6 +725,11 @@ function renderPicker() {
   };
   $('#start').onclick = () => kick('full');
   $('#start-basic').onclick = () => kick('basic');
+  // The dive asks its question in a panel rather than a prompt() so the presets sit next to the box.
+  $('#start-deep').onclick = () => { const p = $('#deep-panel'); p.style.display = p.style.display === 'none' ? '' : 'none'; if (p.style.display !== 'none') $('#deep-q').focus(); };
+  $$('.deep-pick').forEach((b) => b.onclick = () => { $('#deep-q').value = DEEP_PRESETS[Number(b.dataset.i)].question; sync(); });
+  $('#deep-q').oninput = () => sync();
+  $('#deep-go').onclick = () => kick('deep');
   sync();
 }
 
@@ -725,6 +745,7 @@ function renderLive() {
   const cost = jobs.reduce((n, j) => n + (j.cost || 0), 0);
   host.innerHTML =
     '<h2>Run ' + esc(S.run.id) + ' ' + modePill(S.run) + ' — ' + done + '/' + jobs.length + ' finished' + (cost ? ' <span class="muted tiny">$' + cost.toFixed(2) + ' so far</span>' : '') + '</h2>' +
+    (S.run.question ? '<p class="muted tiny" style="margin:-6px 0 12px"><b>Question:</b> ' + esc(S.run.question) + '</p>' : '') +
     (S.run.restored ? '<p class="muted tiny" style="margin:-6px 0 12px">Restored from ' + new Date(S.run.startedAt).toLocaleString() + ' — your last run, brought back after the server restarted. Anything not yet written is still waiting in Review.</p>' : '') +
     (S.run.cancelled ? '<div class="banner warn">This run was stopped by ' + esc(S.run.cancelled) + '. Leads that had already finished are in Review.</div>' : '') +
     jobs.map(renderJob).join('') +
@@ -767,18 +788,22 @@ function renderReview() {
   // A lead with no company description needs a human before it is written — that
   // field is required and a recent run shipped without it.
   const isBasicJob = (j) => j.mode === 'basic' || !!(j.result && j.result.basic);
+  const isDeepJob = (j) => j.mode === 'deep' || !!(j.result && j.result.deepDive);
   const basic = jobs.every(isBasicJob);
-  const allFull = !jobs.some(isBasicJob);
+  const allFull = !jobs.some(isBasicJob) && !jobs.some(isDeepJob);
+  const allDeep = jobs.every(isDeepJob);
   const waiting = jobs.filter((j) => !j.written).length;
   const runs = new Set(jobs.map((j) => j.runId)).size;
-  const noDesc = (j) => !(j.result.fields && String(j.result.fields.Description || '').trim());
+  // A deep dive answers one question and writes only that, so it is not held to the Description rule.
+  const noDesc = (j) => !isDeepJob(j) && !(j.result.fields && String(j.result.fields.Description || '').trim());
   const flagged = jobs.filter((j) => j.result.needsHuman || j.result.contactChanged || noDesc(j));
   const fell = jobs.filter((j) => j.fallback);
   host.innerHTML =
     '<p class="muted tiny" style="margin:-6px 0 12px"><b>' + waiting + ' waiting to be written</b> from ' + runs + ' run' + (runs === 1 ? '' : 's') + '. ' + (basic
       ? '<span class="pill cool">basic</span> Six facts per lead, one lookup each. Writing stamps the record <b>Profile Type: Basic</b> so you can tell it apart from a full profile later.'
       : allFull ? '<span class="pill ok">comprehensive</span> Full research profile. Writing stamps the record <b>Profile Type: Comprehensive</b>.'
-      : 'Full and basic profiles together — each row writes as its own type, <b>Comprehensive</b> or <b>Basic</b>.') + '</p>' +
+      : allDeep ? '<span class="pill flag">deep dive</span> One question each, answered with the full research budget. Writing lands only what the dive established — a <b>DEEP DIVE</b> note plus any field it settled — and leaves the rest of the record, its profile type and its profiled date alone.'
+      : 'Profiles and deep dives together — each row writes as its own kind: <b>Comprehensive</b>, <b>Basic</b>, or just the dive\'s findings.') + '</p>' +
     (fell.length ? '<div class="banner warn"><b>' + fell.length + ' lead' + (fell.length === 1 ? '' : 's') + ' came back as a basic profile instead of a full one</b> — the full session was stopped (' +
       fell.map((j) => esc(j.company) + ': ' + esc((j.fallback && j.fallback.reason) || '')).join('; ') + '). They write as <b>Profile Type: Basic</b> and can be re-run later.</div>' : '') +
     (flagged.length ? '<div class="banner warn"><b>' + flagged.length + ' need' + (flagged.length === 1 ? 's' : '') +
@@ -819,7 +844,7 @@ function renderReview() {
     // "Clean" now also means it has a company description. Approving a lead without
     // one is how the last run put an undescribed company into the CRM.
     jobs.forEach((j) => {
-      const missingDesc = !(j.result.fields && String(j.result.fields.Description || '').trim());
+      const missingDesc = j.mode !== 'deep' && !(j.result.fields && String(j.result.fields.Description || '').trim());
       if (!j.result.needsHuman && !j.result.disqualified && !j.written && !missingDesc) approved.add(j.leadId);
     });
     renderReview();
@@ -850,13 +875,24 @@ function syncWrite() {
 }
 
 const isBasic = (run) => !!(run && run.mode === 'basic');
+const isDeep = (run) => !!(run && run.mode === 'deep');
+
+// The questions reps ask most. Each is the whole research budget on one thing.
+const DEEP_PRESETS = [
+  { label: 'Owner\'s direct phone & mobile', question: 'Find the owner\'s direct phone number and mobile number (and the CEO\'s if the owner is not the CEO), verified against at least two sources where possible, with the do-not-call status of each number.' },
+  { label: 'Who really owns it', question: 'Establish who really owns this company: the people (every owner or partner by name), any parent, holding company or private-equity sponsor, where the owners sit, and how the ownership was confirmed.' },
+  { label: 'Every legal entity', question: 'Find every related legal entity this business runs payroll under — operating companies, staffing arms, per-state or per-facility entities, holding companies — with state of registration, status, role and headcount for each, and the total across the group.' },
+  { label: 'Payroll provider & HR system', question: 'Determine the current payroll provider and HR/HCM/applicant-tracking system, with the evidence for each (job postings, careers-page apply links, portal links, Form 5500 Schedule C, reviews) and when that evidence is dated.' },
+  { label: 'Is the contact still there', question: 'Confirm whether the person on the record is still employed there in that role, and whether their direct phone, mobile and email are current — and if not, who holds that role now.' },
+  { label: 'Headcount, properly', question: 'Establish the real headcount: office versus field staff, per facility or location, the most recent Form 5500 participant count and plan year, and the total across every entity — with the source and date of each figure.' },
+];
 
 // One heading row per run inside the queue, so a result's age and origin are clear.
 function runSeparator(j, cols) {
   const when = j.runStartedAt ? new Date(j.runStartedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
   const current = S.run && S.run.id === j.runId;
   return '<tr class="run-sep"><td colspan="' + cols + '" style="padding:8px 12px;background:var(--panel2);font-size:11px;letter-spacing:.06em;color:var(--dim2)">' +
-    'RUN ' + esc(j.runId) + ' · ' + (j.runMode === 'basic' ? 'basic' : 'comprehensive') + ' · ' + esc(when) +
+    'RUN ' + esc(j.runId) + ' · ' + (j.runMode === 'basic' ? 'basic' : j.runMode === 'deep' ? 'deep dive — <span style="letter-spacing:0;text-transform:none;color:var(--ink)">' + esc(j.runQuestion || '') + '</span>' : 'comprehensive') + ' · ' + esc(when) +
     (current ? ' · <span class="pill cool">latest</span>' : '') + '</td></tr>';
 }
 // open/hide plus, for a row still waiting, a way out of the queue that is not a write.
@@ -864,7 +900,7 @@ function actionsCell(j, isOpen) {
   return '<td style="white-space:nowrap"><button class="link toggle" data-id="' + esc(j.leadId) + '">' + (isOpen ? 'hide' : 'open') + '</button>' +
     (j.written ? '' : ' <button class="link discard" data-id="' + esc(j.leadId) + '" data-company="' + esc(j.company) + '" style="margin-left:8px;color:var(--dim2)">remove</button>') + '</td>';
 }
-const modePill = (run) => isBasic(run) ? '<span class="pill cool">basic</span>' : '<span class="pill ok">comprehensive</span>';
+const modePill = (run) => isBasic(run) ? '<span class="pill cool">basic</span>' : isDeep(run) ? '<span class="pill flag">deep dive</span>' : '<span class="pill ok">comprehensive</span>';
 
 function basicRow(j, inFullTable) {
   const r = j.result, b = r.basic || {}, c = r.contact || {};
@@ -946,9 +982,10 @@ function reviewRow(j) {
   return '<tr>' +
     '<td>' + (j.written ? '<span class="pill ok">✓</span>'
       : '<input type="checkbox" data-id="' + esc(j.leadId) + '" ' + (approved.has(j.leadId) ? 'checked' : '') + '/>') + '</td>' +
-    '<td><b>' + esc(j.company) + '</b>' + (r.disqualified ? '<br><span class="pill bad">DQ</span> <span class="muted tiny">' + esc(r.disqualified) + '</span>' : '') +
-      (!(r.fields && String(r.fields.Description || '').trim()) ? '<br><span class="pill bad">no description</span>' : '') +
-      (!Object.keys(r.notes || {}).some((k) => k.toUpperCase().indexOf('FINDING') >= 0) ? '<br><span class="pill flag">no findings note</span>' : '') + '</td>' +
+    '<td><b>' + esc(j.company) + '</b>' + (j.mode === 'deep' ? ' <span class="pill flag" title="' + esc((r.deepDive && r.deepDive.question) || '') + '">deep dive</span>' : '') +
+      (r.disqualified ? '<br><span class="pill bad">DQ</span> <span class="muted tiny">' + esc(r.disqualified) + '</span>' : '') +
+      (j.mode !== 'deep' && !(r.fields && String(r.fields.Description || '').trim()) ? '<br><span class="pill bad">no description</span>' : '') +
+      (j.mode !== 'deep' && !Object.keys(r.notes || {}).some((k) => k.toUpperCase().indexOf('FINDING') >= 0) ? '<br><span class="pill flag">no findings note</span>' : '') + '</td>' +
     '<td class="tiny">' + esc(name) + '<br><span class="muted">' + esc(c.title || '') + '</span> ' + vflag +
       (r.contactChanged ? '<br><span class="pill flag">replaced</span>' : '') + '</td>' +
     '<td class="num tiny">' + (r.employees == null ? '—' : r.employees) + (r.employeesBasis === 'estimate' ? '<span class="muted">e</span>' : '') +
@@ -1017,12 +1054,20 @@ function writeResultHtml(w) {
   return pill + '<div class="tiny" style="margin-top:4px;line-height:1.6">' + lines.join('<br>') + '</div>';
 }
 
+function deepDiveHtml(d) {
+  const pill = d.status === 'found' ? '<span class="pill ok">found</span>' : d.status === 'partial' ? '<span class="pill flag">partial</span>' : '<span class="pill bad">not found</span>';
+  return '<dt>Deep dive</dt><dd>' + pill + ' <b>' + esc(d.question || '') + '</b>' +
+    '<div style="margin-top:6px;white-space:pre-wrap">' + esc(d.answer || 'Nothing could be established.') + '</div>' +
+    ((d.sources || []).length ? '<div class="muted tiny" style="margin-top:6px">Sources: ' + d.sources.map(esc).join(' · ') + '</div>' : '') + '</dd>';
+}
+
 function detail(j) {
   const r = j.result, c = r.contact || {}, w = j.writeResult;
   const ph = (v, ver, dnc) => v ? esc(v) + ' ' + (ver ? '<span class="pill ok">verified</span>' : '<span class="pill flag">unverified</span>') +
     (dnc ? ' <span class="pill bad">DNC</span>' : '') : '—';
   const notes = Object.entries(r.notes || {}).filter((e) => e[1] && String(e[1]).trim());
   return '<dl class="kv">' +
+    (r.deepDive ? deepDiveHtml(r.deepDive) : '') +
     '<dt>Contact</dt><dd>' + esc([c.firstName, c.lastName].filter(Boolean).join(' ') || '—') + ' — ' + esc(c.title || '') +
       ' <span class="muted tiny">(priority ' + (c.priority == null ? '?' : c.priority) + ')</span></dd>' +
     '<dt>Verified by</dt><dd>' + esc(c.employmentVerifiedBy || '—') + '</dd>' +
@@ -1038,6 +1083,7 @@ function detail(j) {
       ' employees</b></dd>' : '') +
     '<dt>Company description</dt><dd>' + ((r.fields && r.fields.Description)
       ? esc(r.fields.Description).replace(/\n/g, '<br>')
+      : r.deepDive ? '<span class="muted">Not part of this dive — the record keeps the description it has.</span>'
       : '<span style="color:var(--bad)">Missing — this field is required on every lead.</span>') + '</dd>' +
     '<dt>Likely provider</dt><dd>' + esc((r.fields && r.fields.Current_PR_Provider_new) || '—') + '</dd>' +
     '<dt>Leadership roster</dt><dd>' + leadershipList(r) + '<div class="muted tiny" style="margin-top:4px">Written to the record as a LEADERSHIP CONTACTS note; the two additional-contact slots are filled from it when the profile left them empty.</div></dd>' +
@@ -1107,6 +1153,8 @@ function renderStats() {
       tile('$' + s.avgCost.toFixed(2), 'avg cost per lead', money(s.totalCost) + ' total \u00b7 ' + s.avgMinutes.toFixed(0) + ' min each') +
       (s.byMode && s.byMode.basic && s.byMode.basic.leads
         ? tile(s.byMode.basic.leads, 'basic profiles', '$' + s.byMode.basic.avgCost.toFixed(2) + ' each vs $' + ((s.byMode.full || {}).avgCost || 0).toFixed(2) + ' for a full profile \u00b7 ' + s.byMode.basic.written + ' written') : '') +
+      (s.byMode && s.byMode.deep && s.byMode.deep.leads
+        ? tile(s.byMode.deep.leads, 'deep dives', '$' + s.byMode.deep.avgCost.toFixed(2) + ' each \u00b7 ' + s.byMode.deep.written + ' written') : '') +
       tile(s.disqualified, 'disqualified', 'Dissolved, already a client, or under a PEO') +
       tile((s.avgLeadershipPhones || 0).toFixed(1), 'leadership phones per lead', (s.leadershipPhones || 0) + ' executives with a number across every profile') +
       (s.fallbacks ? tile(s.fallbacks, 'fell back to basic', 'Full sessions stopped by a cap and replaced with a basic pass') : '') +

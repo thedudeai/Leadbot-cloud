@@ -1022,6 +1022,7 @@ async function writeNote(leadId, title, content) {
 // Notes a person wrote are never touched.
 const BOT_NOTE_TITLES = new Set([...NOTE_ORDER, 'BASIC PROFILE']);
 const normTitle = (t) => cleanStr(t).toUpperCase().replace(/\s+/g, ' ');
+const isBotTitle = (t) => BOT_NOTE_TITLES.has(normTitle(t)) || /^DEEP DIVE\b/.test(normTitle(t));
 const normNote = (t) => cleanStr(t).replace(/\r\n?/g, '\n').replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 
 async function zohoLeadNotes(leadId) {
@@ -1059,7 +1060,7 @@ async function zohoBotUserId() {
  * Returns { ok, action: 'created' | 'updated' | 'unchanged', removed, error }.
  */
 async function upsertNote(leadId, title, content, existing, botUserId) {
-  const isBot = (n) => botUserId ? !!(n.createdBy && n.createdBy.id === botUserId) : BOT_NOTE_TITLES.has(normTitle(n.title));
+  const isBot = (n) => botUserId ? !!(n.createdBy && n.createdBy.id === botUserId) : isBotTitle(n.title);
   const mine = existing.filter((n) => normTitle(n.title) === normTitle(title) && isBot(n));   // newest first
   let removed = 0;
   const dropOlder = async () => {
@@ -1091,6 +1092,7 @@ async function upsertNote(leadId, title, content, existing, botUserId) {
  */
 async function writeLeadDirect(result, mode = 'full') {
   const basic = mode === 'basic';
+  const deep = mode === 'deep';
   const leadId = String(result.leadId || '');
   const out = { ok: false, partial: false, leadId, fieldsWritten: [], notesWritten: [], notesUpdated: [], notesUnchanged: [], notesRemoved: 0, newLeadId: null, skipped: [], warnings: [], error: null };
   if (!leadId) { out.error = 'This result has no Zoho record id.'; return out; }
@@ -1142,7 +1144,7 @@ async function writeLeadDirect(result, mode = 'full') {
   // record was much harder to use, so a missing one is a loud warning rather than a
   // silent omission — the rest of the record still writes, and the dashboard shows
   // the flag so a human can send the lead back.
-  if (!filled(fields.Description)) {
+  if (!filled(fields.Description) && !deep) {
     out.warnings.push('NO COMPANY DESCRIPTION. The Description field is required on every lead and this profile did not produce one. Re-run this lead or write it by hand.');
   } else {
     fields.Description = expandCodes(fields.Description);
@@ -1198,11 +1200,15 @@ async function writeLeadDirect(result, mode = 'full') {
   // Profiled_Date is the one field from the 2026-08-07 batch still in use. It is
   // bookkeeping for this app rather than content for a rep — the "Never profiled"
   // segment is a query against it — so it stays. Nothing else from that batch does.
-  if (has('Profiled_Date')) payload.Profiled_Date = todayISO();
+  // A deep dive answers one question on top of whatever profile is there; it does
+  // not count as a profile, so it stamps neither the date nor the type.
+  if (deep) { /* leave Profiled_Date and Profile_Type as they are */ }
+  else if (has('Profiled_Date')) payload.Profiled_Date = todayISO();
   else out.skipped.push('Profiled_Date — not on this org\'s Leads layout, so the "never profiled" segment will not exclude this lead.');
   // Two kinds of profile now write to the same record, and a rep needs to know
   // which one they are looking at: a Basic pass is six facts, not a research file.
-  if (has('Profile_Type')) put(payload, 'Profile_Type', basic ? 'Basic' : 'Comprehensive');
+  if (deep) { /* see above */ }
+  else if (has('Profile_Type')) put(payload, 'Profile_Type', basic ? 'Basic' : 'Comprehensive');
   else out.skipped.push('Profile_Type — not on this org\'s Leads layout, so this record is not labelled Basic or Comprehensive.');
 
   const failures = [];
@@ -1238,11 +1244,27 @@ async function writeLeadDirect(result, mode = 'full') {
   // and an absent note is itself the signal that nothing turned up.
   const notes = { ...(result.notes || {}) };
 
+  // What is on the record now, so each section replaces its predecessor instead
+  // of joining it. Read once per write, right before the notes go out.
+  const existing = await zohoLeadNotes(leadId);
+  const botUserId = await zohoBotUserId();
+
   // The leadership roster is always written by the server from the structured list,
   // never taken from a note the model wrote, so it reads identically on every model.
   // Only worth a note when there is more than the primary on it.
   if (roster.length > 1) notes['LEADERSHIP CONTACTS'] = leadershipNote(roster);
   else delete notes['LEADERSHIP CONTACTS'];
+  // A deep dive that came back with part of the roster must not shrink the one on
+  // the record: the fuller note stays and the write says so.
+  if (deep && notes['LEADERSHIP CONTACTS']) {
+    const prevRoster = existing.find((n) => normTitle(n.title) === 'LEADERSHIP CONTACTS' && (botUserId ? !!(n.createdBy && n.createdBy.id === botUserId) : true));
+    // One bullet per person in the note the server writes; the intro line is not a person.
+    const prevLines = prevRoster ? prevRoster.content.split('\n').filter((l) => /^\s*·/.test(l)).length : 0;
+    if (prevLines > roster.length) {
+      delete notes['LEADERSHIP CONTACTS'];
+      out.warnings.push(`The dive came back with a roster of ${roster.length}, smaller than the ${prevLines}-person LEADERSHIP CONTACTS already on the record, so that note was left as it was. Its numbers went into the contact fields where they applied.`);
+    }
+  }
 
   // If the profile found several entities but wrote no structure note, build one —
   // the breakdown behind a rolled-up headcount must be visible, or the number looks
@@ -1258,11 +1280,6 @@ async function writeLeadDirect(result, mode = 'full') {
       + `its own tax filings and its own set of W-2s at year end.\n\n`
       + lines.join('\n') + totalLine;   // boldHeadlines runs on it in the write loop below
   }
-
-  // What is on the record now, so each section replaces its predecessor instead
-  // of joining it. Read once per write, right before the notes go out.
-  const existing = await zohoLeadNotes(leadId);
-  const botUserId = await zohoBotUserId();
 
   for (const title of orderedNotes(notes)) {
     const bodyText = notes[title];
@@ -1284,7 +1301,7 @@ async function writeLeadDirect(result, mode = 'full') {
     else out.notesWritten.push(title);
   }
 
-  if (!basic && !Object.keys(notes).some((k) => k.toUpperCase().includes('FINDING'))) {
+  if (!basic && !deep && !Object.keys(notes).some((k) => k.toUpperCase().includes('FINDING'))) {
     out.warnings.push('No PAYROLL FINDINGS note. That is the most important note on the record — everything about how these people get paid should be in it.');
   }
 
@@ -1822,6 +1839,7 @@ const PROFILE_SCHEMA = {
     notes: { type: 'object', additionalProperties: { type: 'string' } },
     needsHuman: { type: ['string', 'null'] },
     coverage: { type: 'object', additionalProperties: { type: 'boolean' } },
+    deepDive: { type: 'object', properties: { question: { type: 'string' }, answer: { type: 'string' }, status: { type: 'string', enum: ['found', 'partial', 'not found'] }, sources: { type: 'array', items: { type: 'string' } } } },
   },
   required: ['leadId', 'contact', 'fields', 'notes'],
 };
@@ -2005,7 +2023,7 @@ function previousProfileBlock(lead) {
   // The bot's own sections are told apart by author when the API user is known,
   // so a note a rep filed under the same title reads as the team's, not as the
   // profile to build on.
-  const isBot = (n) => BOT_NOTE_TITLES.has(normTitle(n.title)) && (prev.botUserId ? !!(n.createdBy && n.createdBy.id === prev.botUserId) : true);
+  const isBot = (n) => isBotTitle(n.title) && (prev.botUserId ? !!(n.createdBy && n.createdBy.id === prev.botUserId) : true);
   const seen = new Set();
   const bot = prev.notes.filter(isBot).filter((n) => !seen.has(normTitle(n.title)) && seen.add(normTitle(n.title)));
   const other = prev.notes.filter((n) => !isBot(n)).slice(0, 6);
@@ -2193,6 +2211,57 @@ STYLE — identical to the comprehensive profile:
 ${STYLE_SECTION}`);
 }
 
+// ---------------------------------------------------------------- the deep dive
+// One lead, one question, the whole research budget. For when a rep needs one
+// specific thing — the owner's mobile, who really owns the group, every legal
+// entity — and a full profile would spend most of its calls on everything else.
+// Same identity lock, same previous-profile context, same output shape, so the
+// answer lands in the real fields and Review treats it like any other result.
+const DEEP_QUESTION_MAX = 400;
+const deepTopic = (q) => {
+  const s = cleanStr(q).toUpperCase().replace(/[^A-Z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return (s.length > 48 ? s.slice(0, 48).replace(/ [^ ]*$/, '') : s) || 'QUESTION';
+};
+function deepPrompt(lead, question, opts = {}) {
+  const budget = 70;
+  const wall = Number(opts.maxToolCalls) || config.maxToolCallsFull;
+  const topic = deepTopic(question);
+  return applyToolNames(`You are doing a DEEP DIVE on ONE question about one lead for a payroll sales team, headless, inside a dashboard. Not a profile: one question, answered as thoroughly as the sources allow, with the whole research budget behind it. You never write to Zoho; a human reviews the JSON you return and the dashboard writes it. Read-only Zoho calls are fine.
+
+LEAD — this is the complete relevant extract of the Zoho record, current as of this run. Do NOT call getRecord and do NOT re-read this lead from Zoho; start from what is below:
+${leadBlock(lead)}
+
+${identityLock(lead)}
+
+${previousProfileBlock(lead)}THE QUESTION: ${cleanStr(question)}
+
+HOW TO WORK IT:
+- Answer this question and nothing else. Do not verify the rest of the record, do not write a Description, do not look for icebreakers, do not rebuild sections the question does not touch.
+- Use the rulebook's methods for this subject — its escalation ladders (Round 4) are the recipe: phone missing → the phone ladder; who owns it → the ownership and related-entities ladders, the secretary of state officer listing, the website, ZoomInfo's parent/ultimate parent, press; related entities → the related-entities ladder, Form 5500 filings (each entity files its own), state registrations; provider or HR system → the five provider routes; whether a person is still there → the four checks in order. Go down each ladder until it answers or runs out — the point of this mode is to not stop early.
+- Every fact carries its source and a US date, in words a rep can read. Say when something is confirmed by two sources and when it rests on one. Say plainly what you could not establish and what you tried; an honest "not found" with the ladder you exhausted is a good answer, a guess is not.
+- Work efficiently: ONE ToolSearch first ("select:WebSearch,WebFetch,mcp__claude_ai_ZoomInfo__enrich_contacts,mcp__claude_ai_ZoomInfo__search_contacts,mcp__claude_ai_ZoomInfo__enrich_companies,mcp__claude_ai_ZoomInfo__search_scoops,mcp__claude_ai_Zoho_CRM__searchRecords"; if a ZoomInfo tool is missing, ONE keyword ToolSearch for "zoominfo"), each round as ONE message with all its calls, no commentary between calls. Hold everything for the final JSON.
+
+BUDGET: ${budget} tool calls is the ceiling. The server hard-stops this session at ${wall} tool calls, at $${config.maxCostFull} of spend, and at ${config.perLeadTimeoutMin} minutes, and a stopped session returns NOTHING — so at call ${budget - 8}, or when the ladders still open are unlikely to change the answer, stop and return the JSON you have.
+
+OUTPUT: your final answer is the JSON object below and nothing else (the structured output). Fill ONLY what the question established; the dashboard writes exactly the keys you return and leaves the rest of the record alone, so an omitted key means "unchanged", never "unknown".
+${PROFILE_SHAPE}
+Plus, REQUIRED: "deepDive": { "question": "<the question, as asked>", "answer": "<the answer written for the rep: a few plain sentences, every fact with (source) and [US date], what is confirmed and what is not, what you tried for anything not found>", "status": "found" | "partial" | "not found", "sources": ["<one line per source used>"] }
+
+Rules for this mode:
+- "notes" MUST contain exactly one note titled "DEEP DIVE — ${topic}": the answer written in the rulebook's note style (bold headline per line, source and date at the end of each line). It replaces any earlier note with that title. Include another section ONLY when the answer changes it — COMPANY STRUCTURE for entities, PAYROLL FINDINGS for the provider — and then return that section IN FULL, improved, never as an addendum.
+- "contact": only when the question is about the person on record or the owner's reachability; then the person as they should now be on the record. Otherwise return it with empty strings.
+- "leadership": only when the question concerns the owners, the leadership or their phone numbers — and then the COMPLETE roster: every person from the previous LEADERSHIP CONTACTS note carried over, improved with what you found. A partial roster would overwrite a fuller one. Otherwise return [].
+- "entities": only when the question is about related legal entities or group headcount; then every entity you established. Otherwise [].
+- "fields": only the Zoho fields the answer settles (for example Current_PR_Provider_new, HCM, Employee_Count, Number_of_Locations, Entity_Name_Ultimate_Parent, Certified_Active_Company). Never Description in this mode.
+- "needsHuman": one sentence when the answer rests on a judgement a person must make (two candidates, a name match that is not certain); otherwise null.
+
+Field rules that still apply:
+${FIELD_RULES}
+
+RULEBOOK
+${PROFILE_BRIEF}`);
+}
+
 // ---------------------------------------------------------------- job runner
 
 // Preflight is server-wide (it is a property of the server's Claude account).
@@ -2230,7 +2299,7 @@ function restoreRun(rec) {
   const dir = path.join(RUNS, rec.id);
   return {
     id: rec.id, userId: rec.userId, userName: rec.userName, startedAt: rec.startedAt, finishedAt: rec.finishedAt || rec.startedAt, pepm: rec.pepm,
-    mode: rec.mode || 'full', cancelled: rec.cancelled || null,
+    mode: rec.mode || 'full', question: rec.question || null, cancelled: rec.cancelled || null,
     restored: true,
     jobs: rec.jobs.map((j) => {
       const result = readJSON(path.join(dir, `${j.leadId}.json`), null);
@@ -2258,7 +2327,7 @@ function reviewJobs(us) {
     for (const j of run.jobs) {
       if (!j.result || j.discarded) continue;
       if (j.written && run !== us.run) continue;
-      out.push({ ...publicJob(j), runId: run.id, runStartedAt: run.startedAt, runMode: run.mode || 'full', runFinishedAt: run.finishedAt });
+      out.push({ ...publicJob(j), runId: run.id, runStartedAt: run.startedAt, runMode: run.mode || 'full', runQuestion: run.question || null, runFinishedAt: run.finishedAt });
     }
   }
   return out;
@@ -2350,6 +2419,11 @@ function normalizeProfile(raw, lead, mode) {
     if (key && body && !isAbsence(key)) out.notes[key] = body;
   }
 
+  if (j.deepDive && typeof j.deepDive === 'object') {
+    const d = j.deepDive;
+    out.deepDive = { question: cleanStr(d.question), answer: cleanStr(d.answer), status: ['found', 'partial', 'not found'].includes(d.status) ? d.status : (cleanStr(d.answer) ? 'partial' : 'not found'),
+      sources: (Array.isArray(d.sources) ? d.sources : []).map(cleanStr).filter(Boolean).slice(0, 20) };
+  }
   out.employees = numish(j.employees);
   if (out.employees == null && out.fields.Employee_Count != null) out.employees = out.fields.Employee_Count;
   if (out.employees != null && out.fields.Employee_Count == null) out.fields.Employee_Count = out.employees;
@@ -2432,6 +2506,22 @@ async function profileLead(job, run, user, dir) {
   // research sessions from starving one another, not to serialise a quick sweep.
   let res;
   if (run.cancelled) return { error: `Run stopped by ${run.cancelled} before this lead started.` };
+  if (run.mode === 'deep') {
+    // Full research caps, one question, no fallback: a dive that finds nothing says so.
+    res = await runClaude(deepPrompt(job.lead, run.question, { maxToolCalls: Number(config.maxToolCallsFull) || 100 }), {
+      ...common, timeoutMin: Number(config.perLeadTimeoutMin) || 25, maxCost: Number(config.maxCostFull) || 6,
+      maxToolCalls: Number(config.maxToolCallsFull) || 100, schema: PROFILE_SCHEMA,
+      logFile: path.join(dir, `${job.leadId}.deep.log.jsonl`),
+    });
+    record('deep', res);
+    if (res.ok) {
+      const result = normalizeProfile(res.json, job.lead, 'full');
+      if (!result.deepDive) result.deepDive = { question: cleanStr(run.question), answer: '', status: 'not found', sources: [] };
+      if (!result.deepDive.question) result.deepDive.question = cleanStr(run.question);
+      return { result, mode: 'deep' };
+    }
+    return { error: res.stopped === 'budget' ? `Deep dive hit the $${config.maxCostFull} cost ceiling.` : (res.error || 'Deep dive returned nothing usable.') };
+  }
   if (wantBasic) {
     res = await runClaudeNow(...basicOpts('basic'));
     record('basic', res);
@@ -2459,7 +2549,7 @@ async function profileLead(job, run, user, dir) {
   return { error: `Full profile ${reason}; the basic fallback then ${res2.stopped || res2.error || 'failed'} too.` };
 }
 
-async function startRun(user, leads, pepm, mode = 'full') {
+async function startRun(user, leads, pepm, mode = 'full', question = '') {
   const basic = mode === 'basic';
   const id = newRunId();
   const dir = path.join(RUNS, id);
@@ -2468,6 +2558,7 @@ async function startRun(user, leads, pepm, mode = 'full') {
 
   const run = {
     id, userId: user.id, userName: user.name, startedAt: Date.now(), finishedAt: null, pepm, mode,
+    question: mode === 'deep' ? cleanStr(question) : null,
     cancelled: null,
     jobs: leads.map((l) => ({
       leadId: l.id, company: l.company, lead: l, mode,
@@ -2507,7 +2598,7 @@ async function startRun(user, leads, pepm, mode = 'full') {
       if (notes.length) {
         const botUserId = await zohoBotUserId();
         job.lead.previous = { notes, botUserId, profiledDate: job.lead.record.profiledDate || null, profileType: job.lead.record.profileType || null };
-        const sections = notes.filter((n) => BOT_NOTE_TITLES.has(normTitle(n.title)) && (botUserId ? !!(n.createdBy && n.createdBy.id === botUserId) : true)).length;
+        const sections = notes.filter((n) => isBotTitle(n.title) && (botUserId ? !!(n.createdBy && n.createdBy.id === botUserId) : true)).length;
         job.progress.push({ kind: 'note', msg: `Found ${notes.length} note${notes.length === 1 ? '' : 's'} on the record${sections ? ` (${sections} from earlier profiles)` : ''} — this run builds on them instead of starting over.`, at: Date.now() });
         emit('progress', { leadId: job.leadId, kind: 'note', msg: job.progress[job.progress.length - 1].msg }, user.id);
       }
@@ -2576,6 +2667,7 @@ function persistRun(run) {
     finishedAt: run.finishedAt,
     pepm: run.pepm,
     mode: run.mode || 'full',
+    question: run.question || null,
     cancelled: run.cancelled || null,
     jobs: run.jobs.map((j) => ({
       leadId: j.leadId, company: j.company, status: j.status, mode: j.mode || run.mode || 'full',
@@ -2630,7 +2722,7 @@ const publicJob = (j) => ({
 const publicRun = (run) => run && ({
   id: run.id, userId: run.userId, userName: run.userName, restored: !!run.restored, cancelled: run.cancelled || null,
   startedAt: run.startedAt, finishedAt: run.finishedAt,
-  pepm: run.pepm, mode: run.mode || 'full', jobs: run.jobs.map(publicJob),
+  pepm: run.pepm, mode: run.mode || 'full', question: run.question || null, jobs: run.jobs.map(publicJob),
 });
 
 // ---------------------------------------------------------------- stats
@@ -2663,7 +2755,7 @@ function computeStats(scope = {}) {
   // The two profile types cost an order of magnitude apart, so a blended average
   // would say nothing. Each gets its own line.
   const byMode = {};
-  for (const m of ['full', 'basic']) {
+  for (const m of ['full', 'basic', 'deep']) {
     const ls = leads.filter((l) => l.mode === m);
     byMode[m] = { leads: ls.length, written: ls.filter((l) => l.written).length,
       avgCost: ls.length ? sum(ls.map((l) => l.cost)) / ls.length : 0, totalCost: sum(ls.map((l) => l.cost)),
@@ -3141,9 +3233,13 @@ const server = http.createServer(async (req, res) => {
       if (sc.lockOwner && chosen.some((l) => !l.owner || String(l.owner.id) !== String(sc.lockOwner))) {
         return send(res, 403, { error: 'One or more of those leads is not owned by you in Zoho.' });
       }
-      const mode = body.mode === 'basic' ? 'basic' : 'full';
+      const mode = body.mode === 'basic' ? 'basic' : body.mode === 'deep' ? 'deep' : 'full';
       if (mode === 'full' && chosen.length > 50) return send(res, 400, { error: 'Fifty leads per comprehensive run at most. Use Basic profile for a larger sweep.' });
       if (mode === 'basic' && chosen.length > 300) return send(res, 400, { error: 'Three hundred leads per basic run at most.' });
+      const question = cleanStr(body.question);
+      if (mode === 'deep' && !question) return send(res, 400, { error: 'A deep dive needs the question — what exactly should it find out?' });
+      if (mode === 'deep' && question.length > DEEP_QUESTION_MAX) return send(res, 400, { error: `Keep the question under ${DEEP_QUESTION_MAX} characters.` });
+      if (mode === 'deep' && chosen.length > 10) return send(res, 400, { error: 'Ten leads per deep dive at most — it spends a full research budget on each.' });
       // Nothing starts unless the run could finish: Zoho has to be reachable and
       // writable, and ZoomInfo signed in. Otherwise every lead would spend a session
       // and come back with nowhere to go — the exact waste this gate exists to stop.
@@ -3153,14 +3249,15 @@ const server = http.createServer(async (req, res) => {
       }
       // A lead profiled in the last week costs a full lead's worth of credits to do
       // again. Say so once and let the person insist.
-      if (!body.force) {
+      // A deep dive is usually ON a lead profiled recently, so that warning does not apply to it.
+      if (!body.force && mode !== 'deep') {
         const week = 7 * 24 * 3600 * 1000;
         const recent = chosen.filter((l) => l.profiledDate && Date.now() - new Date(l.profiledDate).getTime() < week);
         if (recent.length) return send(res, 409, { error: 'recent', recent: recent.map((l) => ({ id: l.id, company: l.company, profiledDate: l.profiledDate, profileType: l.profileType || null })) });
       }
       const pepm = body.pepm || config.pepm;
       if (pepm !== config.pepm) { config.pepm = pepm; writeJSON(CONFIG_PATH, config); }
-      const id = await startRun(user, chosen, pepm, mode);
+      const id = await startRun(user, chosen, pepm, mode, question);
       return send(res, 200, { runId: id });
     }
 
