@@ -18,7 +18,7 @@ a login in front of it so the whole payroll team can use one deployment.
 | Zoho credentials | `data/zoho.json` on the desktop | `ZOHO_*` environment variables (an admin can still override them in Setup) |
 | Storage | the app folder | a persistent volume at `DATA_DIR` (`/data` on Railway) |
 
-## Two profile types
+## Two profile types (and a deep dive — see below)
 
 | | Comprehensive (**Profile**) | Basic (**Basic profile**) |
 |---|---|---|
@@ -76,6 +76,30 @@ confirm; Zoho API calls time out at 30 s instead of hanging a write forever; a c
 no longer takes the run down; stopped sessions get an estimated cost from their token usage
 (marked *est.*) so Stats stops under-counting them; `config.json` from an earlier version gets the
 new defaults and `model` is migrated from '' (the CLI's priciest default) to `sonnet`.
+
+## Deep dive — one question, the whole research budget (8 Oct 2026)
+
+A third button under the lead table, **Deep dive…**, for when a rep needs one specific thing on a
+lead and a full profile would spend most of its calls on everything else: the owner's mobile,
+who really owns the group, every legal entity it runs payroll under, the current provider,
+whether the person on record is still there, the real headcount. The panel offers those six as
+presets and takes any question of your own (up to 400 characters), on up to ten leads at once.
+
+The session gets the same identity lock and the same previous-profile context as a full profile,
+the full profile's caps (`maxCostFull`, `maxToolCallsFull`, `perLeadTimeoutMin`, the company-wide
+session cap), and the rulebook's escalation ladders as its method — with the instruction to go
+down each ladder until it answers or runs out, and to say plainly what it tried for anything it
+could not find. There is no fallback: a dive that finds nothing says so.
+
+The result lands in Review like any other, tagged **deep dive** with the question in its run
+heading, and the answer (found / partial / not found, with sources) at the top of the row's
+detail. Writing lands **only what the dive established**: a `DEEP DIVE — <TOPIC>` note (updated
+in place on a repeat), any field it settled, the contact's numbers when the question was about
+them. It stamps neither `Profiled_Date` nor `Profile_Type`, does not demand a Description, and a
+dive that came back with part of the leadership roster never shrinks the fuller
+LEADERSHIP CONTACTS already on the record. `POST /api/run` takes `mode: "deep"` plus `question`;
+the 7-day "profiled recently" warning does not apply to dives. Stats shows them as their own
+line.
 
 ## A re-profile improves the record instead of repeating it (24 Sep 2026)
 

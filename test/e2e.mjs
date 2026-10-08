@@ -130,6 +130,36 @@ s = await pollRun('rep', (x) => x.run.jobs[0].written);
   ok('re-writing the same profile changes no note and adds none');
 }
 
+// 5d. A deep dive: one question, the full budget, lands like a profile but writes only its finding.
+r = await call('rep', '/api/run', { mode: 'deep', leads: [{ id: '5001', company: 'Alpha Care', owner: { id: '999' } }] });
+assert.equal(r.status, 400); assert.match(r.json.error, /needs the question/); ok('a deep dive without a question is refused');
+r = await call('rep', '/api/run', { mode: 'deep', question: 'x'.repeat(401), leads: [{ id: '5001', company: 'Alpha Care', owner: { id: '999' } }] }); assert.equal(r.status, 400); ok('…and so is an overlong one');
+r = await call('rep', '/api/run', { mode: 'deep', question: "Find the owner's mobile number", leads: Array.from({ length: 11 }, (_, i) => ({ id: String(5300 + i), company: 'X', owner: { id: '999' } })) }); assert.equal(r.status, 400); assert.match(r.json.error, /Ten leads/); ok('…and more than ten leads');
+r = await call('rep', '/api/run', { mode: 'deep', question: "Find the owner's mobile number", leads: [{ id: '5001', company: 'Alpha Care', owner: { id: '999' }, profiledDate: new Date().toISOString().slice(0, 10) }, { id: '5201', company: 'Deep Co', owner: { id: '999' } }] });
+assert.equal(r.status, 200); const deepRun = r.json.runId; ok('a deep dive on a lead profiled today starts without the 7-day warning');
+s = await pollRun('rep', (x) => x.run && x.run.id === deepRun && x.run.finishedAt && x.run.jobs.every((j) => j.status === 'done'), 100);
+{
+  assert.equal(s.run.mode, 'deep'); assert.equal(s.run.question, "Find the owner's mobile number");
+  const j = s.run.jobs.find((x) => x.leadId === '5001');
+  assert.equal(j.mode, 'deep'); assert.equal(j.result.deepDive.status, 'found'); assert.match(j.result.deepDive.answer, /917-555-0199/); assert.equal(j.result.deepDive.question, "Find the owner's mobile number");
+  assert.equal(j.result.contact.mobilePhone, '917-555-0199'); assert.equal(j.result.leadership.length, 2); ok('the dive returns its answer, the contact\'s numbers and the full roster');
+  const prompt = fs.readFileSync(path.join(STORE, 'prompts', '5001.deep.txt'), 'utf8');
+  assert.match(prompt, /DEEP DIVE on ONE question/); assert.match(prompt, /THE QUESTION: Find the owner's mobile number/); assert.match(prompt, /LOCK THE IDENTITY/); assert.match(prompt, /PREVIOUS PROFILE/);
+  assert.match(prompt, /"DEEP DIVE — FIND THE OWNER S MOBILE NUMBER"/); assert.match(prompt, /Never Description in this mode/); ok('the deep prompt carries the question, the identity lock, the previous profile and the note title');
+  assert.ok(s.review.some((x) => x.leadId === '5001' && x.runId === deepRun && !x.written)); ok('the dive waits in Review like any result');
+}
+r = await call('rep', '/api/write', { leadIds: ['5001'] }); assert.equal(r.json.queued, 1);
+s = await pollRun('rep', (x) => x.run.jobs.find((j) => j.leadId === '5001').written);
+{
+  const w = s.run.jobs.find((j) => j.leadId === '5001').writeResult, last = zohoStub.state.writes[zohoStub.state.writes.length - 1];
+  assert.equal(last.id, '5001'); assert.equal(last.Mobile, '917-555-0199'); assert.equal(last.Profile_Type, undefined); assert.equal(last.Profiled_Date, undefined); assert.equal(last.Description, undefined);
+  assert.deepEqual(w.notesWritten, ['DEEP DIVE — OWNER PHONE']); assert.deepEqual(w.notesUnchanged, []); assert.deepEqual(w.notesUpdated, []); assert.ok(!w.warnings.some((x) => /PAYROLL FINDINGS/.test(x)));
+  assert.ok(w.warnings.some((x) => /roster of 2, smaller than the 5-person LEADERSHIP CONTACTS/.test(x)), JSON.stringify(w.warnings));
+  assert.equal(zohoStub.state.noteUpdates.filter((id) => zohoStub.state.notes.find((n) => n.id === id && n.Note_Title === 'LEADERSHIP CONTACTS')).length, 0);
+  ok('writing a dive lands the number and its note, keeps the fuller roster on the record, and stamps neither profile type nor date');
+}
+r = await call('rep', '/api/review/discard', { leadIds: ['5201'] }); assert.equal(r.json.removed, 1);
+
 // A session that drifts to a look-alike company is caught by the server: its website is not the record's.
 r = await call('rep', '/api/run', { leads: [{ id: '5101', company: 'Drift Co', owner: { id: '999' } }] }); assert.equal(r.status, 200); const driftRun = r.json.runId;
 s = await pollRun('rep', (x) => x.run && x.run.id === driftRun && x.run.finishedAt, 100);
@@ -191,8 +221,8 @@ assert.equal(r.status, 400); assert.match(r.json.error, /Basic profile/); ok('51
 
 // 6. Stats
 r = await call('rep', '/api/stats?scope=all'); assert.equal(r.status, 403); ok('rep cannot see everyone stats');
-r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 33); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 4);
-assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 7); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
+r = await call('admin', '/api/stats?scope=all'); assert.equal(r.json.totalLeads, 35); assert.equal(r.json.fallbacks, 1); assert.equal(r.json.byPerson[0].name, 'Rep One'); assert.equal(r.json.byPerson[0].written, 5);
+assert.equal(r.json.byMode.basic.leads, 26); assert.equal(r.json.byMode.full.leads, 7); assert.equal(r.json.byMode.deep.leads, 2); assert.equal(r.json.byMode.deep.written, 1); assert.ok(r.json.byMode.basic.avgCost < r.json.byMode.full.avgCost); ok('admin sees company stats by person and by profile type');
 r = await call('admin', '/api/stats'); assert.equal(r.json.totalLeads, 0); ok("admin's own stats are separate");
 
 // 6a. The readiness gate: nothing runs while Zoho cannot take the write-back or

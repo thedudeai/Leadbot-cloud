@@ -79,6 +79,30 @@ await r.click('nav button[data-v="review"]'); await r.waitForSelector('#review-b
 await r.click('#review-body .toggle'); await wait(200);
 await r.screenshot({ path: path.join(ROOT, 'test', 'shot-rep-review.png'), fullPage: true });
 await r.click('#approve-all'); await r.click('#write'); await r.waitForSelector('#review-body .pill.ok:text-is("✓")', { timeout: 15000 });
+// deep dive: third button opens the panel, a preset fills the question, the result shows its answer in Review
+await r.click('nav button[data-v="run"]'); await r.waitForSelector('#picker tbody tr', { timeout: 15000 });
+await r.click('#picker tbody tr input');
+if (!(await r.locator('#deep-panel').isHidden())) throw new Error('deep panel open before the button was pressed');
+await r.click('#start-deep'); await r.waitForSelector('#deep-panel', { state: 'visible' });
+if (!(await r.locator('#deep-go').isDisabled())) throw new Error('deep-dive start enabled with an empty question');
+await r.click('.deep-pick >> nth=0');
+if (!(await r.inputValue('#deep-q')).includes('mobile number')) throw new Error('preset did not fill the question');
+if ((await r.textContent('#deep-go')) !== 'Deep dive 1 lead') throw new Error('deep button label wrong: ' + await r.textContent('#deep-go'));
+await r.click('#deep-go');
+await r.waitForSelector('#live .pill.flag:text-is("deep dive")', { timeout: 20000 });
+if (!(await r.textContent('#live')).includes('Question:')) throw new Error('live screen does not show the question');
+await r.waitForSelector('#live .pill.ok:text-is("done")', { timeout: 20000 });
+await r.click('nav button[data-v="review"]'); await r.waitForSelector('#review-body tbody tr');
+if (!(await r.textContent('#review-body .run-sep')).includes('deep dive —')) throw new Error('review heading lacks the dive');
+for (const t of await r.locator('#review-body .toggle').all()) { if ((await t.textContent()) === 'open') { await t.click(); await wait(150); } }
+const deepText = await r.textContent('#review-body');
+if (!deepText.includes('Deep dive') || !deepText.includes('917-555-0199') || !deepText.includes('found')) throw new Error('deep dive answer missing from the detail panel: ' + deepText.slice(0, 300));
+if (deepText.includes('no description') || deepText.includes('no findings note') || deepText.includes('required on every lead')) throw new Error('a dive is being held to the full-profile checks');
+await r.click('#approve-all'); if ((await r.textContent('#write')) !== 'Write 1 to Zoho') throw new Error('Approve all clean skipped the dive: ' + await r.textContent('#write'));
+await r.click('#write'); await r.waitForSelector('#review-body .pill.ok:text-is("✓")', { timeout: 15000 });
+await r.screenshot({ path: path.join(ROOT, 'test', 'shot-rep-review-deep.png'), fullPage: true });
+console.log('  deep dive asked, run and shown in review');
+
 // basic profile: second button, basic review table, basic detail, write
 await r.click('nav button[data-v="run"]'); await r.waitForSelector('#picker tbody tr', { timeout: 15000 });
 await r.click('#picker tbody tr input');

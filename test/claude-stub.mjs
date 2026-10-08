@@ -24,7 +24,7 @@ process.stdin.on('end', () => {
   // Every prompt is kept so a test can check what the session was actually told.
   try {
     const id = (prompt.match(/Zoho record id: (\d+)/) || [])[1];
-    if (id && process.env.DATA_DIR) { fs.mkdirSync(path.join(process.env.DATA_DIR, 'prompts'), { recursive: true }); fs.writeFileSync(path.join(process.env.DATA_DIR, 'prompts', `${id}.${prompt.includes('BASIC PROFILE of one company') ? 'basic' : 'full'}.txt`), prompt); }
+    if (id && process.env.DATA_DIR) { fs.mkdirSync(path.join(process.env.DATA_DIR, 'prompts'), { recursive: true }); fs.writeFileSync(path.join(process.env.DATA_DIR, 'prompts', `${id}.${prompt.includes('BASIC PROFILE of one company') ? 'basic' : prompt.includes('DEEP DIVE on ONE question') ? 'deep' : 'full'}.txt`), prompt); }
   } catch {}
   let json;
   if (prompt.includes('one-shot capability check')) json = { skill: true, zoho: true, zohoLeadsReachable: true, zoominfo: true, websearch: true, notes: 'stub' };
@@ -46,6 +46,19 @@ process.stdin.on('end', () => {
     const tick = () => { say({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'WebSearch', input: { query: 'again' } }] } }); setTimeout(tick, 50); };
     tick();
     return;
+  }
+  else if (prompt.includes('DEEP DIVE on ONE question')) {
+    // One question, answered: the owner's numbers, the roster carried over, one DEEP DIVE note, no Description.
+    const id = (prompt.match(/Zoho record id: (\d+)/) || [])[1];
+    const company = (prompt.match(/- Company: (.*)/) || [])[1];
+    const question = (prompt.match(/THE QUESTION: (.*)/) || [])[1];
+    json = { leadId: id, company, contactChanged: false,
+      contact: { firstName: 'Pat', lastName: 'Lee', title: 'CEO', directPhone: '2125551212', directPhoneVerified: true, mobilePhone: '917-555-0199', mobilePhoneVerified: true, employmentVerifiedBy: 'ZoomInfo and the state licence registry, 10/8/2026' },
+      leadership: [{ firstName: 'Pat', lastName: 'Lee', title: 'CEO', directPhone: '2125551212', mobilePhone: '917-555-0199', source: 'ZoomInfo + licence registry', date: '10/8/2026' }, { firstName: 'Ana', lastName: 'Cruz', title: 'CFO', functionalRole: 'CFO', directPhone: '212-555-3434', email: 'ana@x.com', source: 'company website', date: '9/1/2026' }],
+      entities: [], additionalContacts: [], fields: {},
+      notes: { 'DEEP DIVE — OWNER PHONE': 'OWNER MOBILE FOUND — Pat Lee answers 917-555-0199; confirmed by the state licence registry and ZoomInfo. (registry, ZoomInfo) [10/8/2026]' },
+      needsHuman: null, coverage: { directPhone: true },
+      deepDive: { question, answer: 'Pat Lee\'s mobile is 917-555-0199, confirmed by the state licence registry and ZoomInfo (10/8/2026). The direct line 212-555-1212 still rings the office.', status: 'found', sources: ['state licence registry, 10/8/2026', 'ZoomInfo enrich_contacts, 10/8/2026'] } };
   }
   else if (prompt.includes('- Company: Drift Co')) {
     // A session that wandered off to a look-alike: the website it returns is not the record's.
